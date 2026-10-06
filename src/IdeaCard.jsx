@@ -11,6 +11,13 @@ function formatDate(iso) {
 }
 
 export default function IdeaCard({ idea, onDelete }) {
+  function handleDelete() {
+    // 실수로 지우지 않도록 삭제 전에 한 번 확인한다
+    if (window.confirm(`'${idea.title}' 아이디어를 삭제할까요?`)) {
+      onDelete(idea.id)
+    }
+  }
+
   return (
     <li className="card">
       <div className="card-head">
@@ -18,7 +25,7 @@ export default function IdeaCard({ idea, onDelete }) {
         <button
           type="button"
           className="delete"
-          onClick={() => onDelete(idea.id)}
+          onClick={handleDelete}
           aria-label={`${idea.title} 삭제`}
         >
           삭제
