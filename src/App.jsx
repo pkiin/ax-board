@@ -21,7 +21,7 @@ export default function App() {
   return (
     <div className="page">
       <header className="page-header">
-        <h1>우리 팀 AX 보드</h1>
+        <h1>우리 팀 AX 보드 - B</h1>
         <p className="page-subtitle">
           업무에 AI를 어떻게 활용할지 아이디어를 모아 두는 공간입니다.
         </p>
