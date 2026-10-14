@@ -6,13 +6,14 @@ const EMPTY = { title: '', target: '', idea: '' }
 export default function IdeaForm({ onAdd }) {
   const [form, setForm] = useState(EMPTY)
   const [error, setError] = useState('')
+  const [submitting, setSubmitting] = useState(false)
 
   function handleChange(event) {
     const { name, value } = event.target
     setForm((prev) => ({ ...prev, [name]: value }))
   }
 
-  function handleSubmit(event) {
+  async function handleSubmit(event) {
     event.preventDefault()
 
     const title = form.title.trim()
@@ -24,15 +25,23 @@ export default function IdeaForm({ onAdd }) {
       return
     }
 
-    onAdd({
-      id: createId(),
-      title,
-      target,
-      idea,
-      createdAt: new Date().toISOString(),
-    })
-    setForm(EMPTY)
-    setError('')
+    setSubmitting(true)
+    try {
+      await onAdd({
+        id: createId(),
+        title,
+        target,
+        idea,
+        createdAt: new Date().toISOString(),
+      })
+      setForm(EMPTY)
+      setError('')
+    } catch (err) {
+      // 저장에 실패하면 입력 내용을 지우지 않고 다시 시도할 수 있게 둔다
+      setError(`저장하지 못했습니다. ${err.message}`)
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   return (
@@ -74,8 +83,8 @@ export default function IdeaForm({ onAdd }) {
 
       {error && <p className="error">{error}</p>}
 
-      <button type="submit" className="submit">
-        아이디어 추가
+      <button type="submit" className="submit" disabled={submitting}>
+        {submitting ? '저장 중…' : '아이디어 추가'}
       </button>
     </form>
   )
