@@ -189,6 +189,33 @@ async function fetchNews(query) {
   })
 }
 
+// Finnhub 시세. 무료 한도(분당 60회)를 넘지 않게 종목별로 1분 동안 캐시한다
+const FINNHUB_QUOTE_URL = 'https://finnhub.io/api/v1/quote'
+const DEFAULT_SYMBOL = 'AAPL'
+const SYMBOL_PATTERN = /^[A-Z0-9.:-]{1,15}$/
+const STOCK_TTL = 60 * 1000
+
+const stockCache = new Map() // symbol → { data, expiresAt }
+
+async function fetchQuote(symbol) {
+  let res
+  let body
+  try {
+    res = await fetch(`${FINNHUB_QUOTE_URL}?${new URLSearchParams({ symbol, token: process.env.FINNHUB_API_KEY.trim() })}`, {
+      signal: AbortSignal.timeout(5000),
+    })
+    body = await res.json()
+  } catch (err) {
+    throw new UpstreamError(`Finnhub 응답을 받지 못했습니다. (${err.name})`)
+  }
+  if (!res.ok) throw new UpstreamError(`Finnhub 오류 (${res.status}): ${body?.error ?? '알 수 없는 응답'}`)
+  // 없는 종목은 200에 c: 0, dp: null로 오기도 한다
+  if (typeof body?.c !== 'number' || typeof body?.dp !== 'number' || body.c === 0) {
+    throw new UpstreamError(`Finnhub 시세 없음: ${symbol}`)
+  }
+  return { price: body.c, changePct: body.dp }
+}
+
 async function handle(req, res) {
   const url = new URL(req.url, 'http://localhost')
   const path = url.pathname
@@ -269,6 +296,29 @@ async function handle(req, res) {
       if (!(err instanceof UpstreamError)) throw err
       console.error(err.message)
       return send(res, 502, { error: '뉴스를 가져오지 못했습니다.' })
+    }
+  }
+
+  // 주식 시세. Finnhub 키는 token 쿼리로만 보내고 응답·로그에 내보내지 않는다
+  if (path === '/api/stock' && req.method === 'GET') {
+    if (!process.env.FINNHUB_API_KEY?.trim()) {
+      return send(res, 503, { error: 'FINNHUB_API_KEY가 없습니다. .env 파일을 확인해 주세요.' })
+    }
+    const symbol = (url.searchParams.get('s')?.trim() || DEFAULT_SYMBOL).toUpperCase()
+    if (!SYMBOL_PATTERN.test(symbol)) return send(res, 400, { error: '종목 기호 형식이 올바르지 않습니다.' })
+
+    const cached = stockCache.get(symbol)
+    if (cached && cached.expiresAt > Date.now()) return send(res, 200, cached.data)
+    try {
+      const data = await fetchQuote(symbol)
+      // 지난 항목을 정리해 Map이 계속 커지지 않게 한다
+      for (const [key, entry] of stockCache) if (entry.expiresAt <= Date.now()) stockCache.delete(key)
+      stockCache.set(symbol, { data, expiresAt: Date.now() + STOCK_TTL })
+      return send(res, 200, data)
+    } catch (err) {
+      if (!(err instanceof UpstreamError)) throw err
+      console.error(err.message)
+      return send(res, 502, { error: '시세를 가져오지 못했습니다.' })
     }
   }
 

@@ -350,6 +350,33 @@ body {
   color: var(--muted);
 }
 
+.stock-now {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0;
+}
+
+.stock-price {
+  font-size: 1.75rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.stock-change {
+  font-weight: 600;
+  color: var(--muted);
+}
+
+/* 국내 표기 관례대로 오르면 빨강, 내리면 파랑 */
+.stock-change.up {
+  color: #d92d20;
+}
+
+.stock-change.down {
+  color: #1d5fd6;
+}
+
 /* 좁은 화면에서는 한 줄로 쌓고 카드 영역을 맨 위에 둔다 */
 @media (max-width: 800px) {
   .page {

@@ -3,6 +3,7 @@ import IdeaForm from './IdeaForm.jsx'
 import IdeaCard from './IdeaCard.jsx'
 import WeatherCard from './WeatherCard.jsx'
 import NewsCard from './NewsCard.jsx'
+import StockCard from './StockCard.jsx'
 import { createIdea, deleteIdea, fetchIdeas, migrateLegacyIdeas } from './api.js'
 
 export default function App() {
@@ -49,11 +50,12 @@ export default function App() {
 
   return (
     <div className="page">
-      {/* 왼쪽 "오늘의 정보" 영역: 날씨 → 뉴스 → (주가) 순서로 붙인다 */}
+      {/* 왼쪽 "오늘의 정보" 영역: 날씨 → 뉴스 → 주가. 카드마다 따로 불러와 서로 기다리지 않는다 */}
       <aside className="side" aria-labelledby="side-title">
         <h2 id="side-title" className="side-title">오늘의 정보</h2>
         <WeatherCard />
         <NewsCard />
+        <StockCard />
       </aside>
 
       <main className="main">
