@@ -150,6 +150,45 @@ async function fetchWeather() {
   }
 }
 
+// 네이버 뉴스 검색 (최신순 3건)
+const NAVER_NEWS_URL = 'https://openapi.naver.com/v1/search/news.json'
+const MAX_QUERY = 50
+const HTML_ENTITIES = { '&quot;': '"', '&amp;': '&', '&lt;': '<', '&gt;': '>', '&#39;': "'", '&apos;': "'", '&nbsp;': ' ' }
+
+// 검색어 강조용 <b> 태그를 지우고 엔티티(&quot; 등)를 글자로 바꾼다
+function cleanTitle(title) {
+  return title.replace(/<\/?b>/gi, '').replace(/&(quot|amp|lt|gt|#39|apos|nbsp);/g, (m) => HTML_ENTITIES[m])
+}
+
+async function fetchNews(query) {
+  let res
+  let body
+  try {
+    res = await fetch(`${NAVER_NEWS_URL}?${new URLSearchParams({ query, display: '3', sort: 'date' })}`, {
+      headers: {
+        'X-Naver-Client-Id': process.env.NAVER_CLIENT_ID.trim(),
+        'X-Naver-Client-Secret': process.env.NAVER_CLIENT_SECRET.trim(),
+      },
+      signal: AbortSignal.timeout(5000),
+    })
+    body = await res.json()
+  } catch (err) {
+    throw new UpstreamError(`네이버 응답을 받지 못했습니다. (${err.name})`)
+  }
+  if (!res.ok || !Array.isArray(body?.items)) {
+    throw new UpstreamError(`네이버 오류 (${res.status}): ${body?.errorMessage ?? '알 수 없는 응답'}`)
+  }
+
+  return body.items.map((item) => {
+    const date = new Date(item.pubDate)
+    return {
+      title: cleanTitle(item.title),
+      link: item.link,
+      date: Number.isNaN(date.getTime()) ? null : date.toISOString(),
+    }
+  })
+}
+
 async function handle(req, res) {
   const url = new URL(req.url, 'http://localhost')
   const path = url.pathname
@@ -213,6 +252,23 @@ async function handle(req, res) {
       if (!(err instanceof UpstreamError)) throw err
       console.error(err.message)
       return send(res, 502, { error: '날씨 정보를 가져오지 못했습니다.' })
+    }
+  }
+
+  // 뉴스 검색. 네이버 키는 헤더로만 보내고 응답·로그에 내보내지 않는다
+  if (path === '/api/news' && req.method === 'GET') {
+    if (!process.env.NAVER_CLIENT_ID?.trim() || !process.env.NAVER_CLIENT_SECRET?.trim()) {
+      return send(res, 503, { error: 'NAVER_CLIENT_ID 또는 NAVER_CLIENT_SECRET이 없습니다. .env 파일을 확인해 주세요.' })
+    }
+    const query = url.searchParams.get('q')?.trim() ?? ''
+    if (!query) return send(res, 400, { error: '검색어를 입력해 주세요.' })
+    if (query.length > MAX_QUERY) return send(res, 400, { error: `검색어는 ${MAX_QUERY}자 이하로 입력해 주세요.` })
+    try {
+      return send(res, 200, await fetchNews(query))
+    } catch (err) {
+      if (!(err instanceof UpstreamError)) throw err
+      console.error(err.message)
+      return send(res, 502, { error: '뉴스를 가져오지 못했습니다.' })
     }
   }
 

@@ -22,7 +22,7 @@ export default function WeatherCard() {
 
   return (
     <section className="widget" aria-label="천안 현재 날씨">
-      <h2 className="widget-title">천안 현재 날씨</h2>
+      <h3 className="widget-title">천안 현재 날씨</h3>
 
       {error ? (
         <p className="widget-message error">{error}</p>
