@@ -79,6 +79,27 @@ export function createBriefing({ symbols, model, speechModel, voice }) {
   return request('/api/briefing', { method: 'POST', body: JSON.stringify({ symbols, model, speechModel, voice }) })
 }
 
+export function fetchIdea(id) {
+  return request(`/api/ideas/${encodeURIComponent(id)}`)
+}
+
+// 활용 장면 영상: 시나리오·예상 금액만 받는다 (영상은 createVideo를 눌러야 만든다)
+export function planVideo(id, model, textModel) {
+  return request('/api/ai/video/plan', { method: 'POST', body: JSON.stringify({ id, model, textModel }) })
+}
+
+// 작업만 제출하고 status: generating인 카드를 돌려받는다. 완료는 fetchIdea로 다시 읽어 확인한다
+export function createVideo(id, { model, before, after, prompt, duration, audio, firstFrame }) {
+  return request(`/api/ideas/${encodeURIComponent(id)}/video`, {
+    method: 'POST',
+    body: JSON.stringify({ model, before, after, prompt, duration, audio, firstFrame }),
+  })
+}
+
+export function deleteVideo(id) {
+  return request(`/api/ideas/${encodeURIComponent(id)}/video`, { method: 'DELETE' })
+}
+
 // 다듬은 결과만 받는다. 저장은 applyProposal로 따로 한다
 export function refineIdea(id, model) {
   return request('/api/ai/refine', { method: 'POST', body: JSON.stringify({ id, model }) })
