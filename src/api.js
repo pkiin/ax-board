@@ -25,6 +25,19 @@ export function deleteIdea(id) {
   return request(`/api/ideas/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 
+export function fetchModels() {
+  return request('/api/ai/models')
+}
+
+// 다듬은 결과만 받는다. 저장은 applyProposal로 따로 한다
+export function refineIdea(id, model) {
+  return request('/api/ai/refine', { method: 'POST', body: JSON.stringify({ id, model }) })
+}
+
+export function applyProposal(id, proposal) {
+  return request(`/api/ideas/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify({ proposal }) })
+}
+
 export function fetchWeather() {
   return request('/api/weather')
 }

@@ -446,11 +446,369 @@ body {
   color: #1d5fd6;
 }
 
+/* 오른쪽 위 톱니바퀴 설정 버튼 */
+.page-header {
+  position: relative;
+  padding-right: 48px;
+}
+
+.settings-button {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 38px;
+  height: 38px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.settings-button:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* 설정 팝업 */
+.settings {
+  width: min(560px, calc(100vw - 32px));
+  max-height: min(720px, calc(100vh - 48px));
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  color: var(--text);
+}
+
+.settings[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+.settings::backdrop {
+  background: rgb(16 24 40 / 0.45);
+}
+
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.settings-head h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.icon-button {
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 1.25rem;
+  cursor: pointer;
+}
+
+.icon-button:hover {
+  background: var(--bg);
+}
+
+.settings-desc {
+  margin: 4px 0 12px;
+  font-size: 0.875rem;
+  color: var(--muted);
+}
+
+.settings-filter {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 10px;
+  font-size: 0.875rem;
+}
+
+.settings-filter input[type="search"] {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+}
+
+.settings-filter label {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.model-list {
+  flex: 1;
+  min-height: 160px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.model-list .widget-message {
+  padding: 16px;
+}
+
+.model-option {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.875rem;
+  cursor: pointer;
+}
+
+.model-option:last-child {
+  border-bottom: 0;
+}
+
+.model-option:hover,
+.model-option.selected {
+  background: #eef3ff;
+}
+
+.model-name {
+  flex: 1;
+  min-width: 0;
+  font-weight: 600;
+  word-break: break-word;
+}
+
+.model-name small {
+  display: block;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.model-price {
+  flex-shrink: 0;
+  max-width: 45%;
+  text-align: right;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.model-price.free {
+  font-weight: 700;
+  color: #067647;
+}
+
+.paid-warning {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #fef3f2;
+  color: #b42318;
+  font-size: 0.875rem;
+}
+
+.settings-actions,
+.refine-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.button-primary,
+.button-secondary {
+  padding: 7px 16px;
+  border-radius: 8px;
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.button-primary {
+  border: 0;
+  background: var(--accent);
+  color: #fff;
+}
+
+.button-secondary {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+}
+
+.button-primary:disabled,
+.button-secondary:disabled,
+.refine-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* 카드의 AI로 다듬기 */
+.card-actions {
+  display: flex;
+  flex-shrink: 0;
+  gap: 6px;
+}
+
+.refine-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.refine-button:hover:not(:disabled) {
+  background: #eef3ff;
+}
+
+.paid-badge {
+  padding: 0 5px;
+  border-radius: 4px;
+  background: #fef3f2;
+  color: #b42318;
+  font-size: 0.6875rem;
+}
+
+.card-error {
+  margin: 12px 0 0;
+}
+
+.refine {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px dashed var(--border);
+}
+
+.refine-columns {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.refine-col {
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+}
+
+.refine-col.refined {
+  border-color: #b2ccff;
+  background: #f5f8ff;
+}
+
+.refine-col h4 {
+  margin: 0 0 6px;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.refine-title {
+  margin: 0;
+  font-weight: 700;
+  word-break: break-word;
+}
+
+.refine-col .card-body {
+  margin-top: 8px;
+}
+
+.refine-meta {
+  margin: 10px 0 0;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+/* .card-body dd:last-child보다 우선하도록 .card-body를 함께 쓴다 */
+.card-body.proposal > div > dd {
+  margin: 4px 0 12px;
+}
+
+.card-body.proposal > div:last-child > dd {
+  margin-bottom: 0;
+}
+
+.difficulty {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.8125rem;
+  font-weight: 600;
+}
+
+.difficulty.쉬움 {
+  background: #ecfdf3;
+  color: #067647;
+}
+
+.difficulty.보통 {
+  background: #fffaeb;
+  color: #b54708;
+}
+
+.difficulty.어려움 {
+  background: #fef3f2;
+  color: #b42318;
+}
+
+.original {
+  margin-top: 12px;
+  font-size: 0.875rem;
+}
+
+.original summary {
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.original .refine-title {
+  margin-top: 8px;
+}
+
 /* 좁은 화면에서는 한 줄로 쌓고 카드 영역을 맨 위에 둔다 */
 @media (max-width: 800px) {
   .page {
     grid-template-columns: minmax(0, 1fr);
     gap: 24px;
+  }
+
+  .refine-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* 한 줄로 쌓이면 헤더가 아래로 내려가므로 톱니바퀴는 페이지 오른쪽 위에 둔다 */
+  .page {
+    position: relative;
+  }
+
+  .page-header {
+    position: static;
+    padding-right: 0;
+  }
+
+  .settings-button {
+    top: 16px;
+    right: 16px;
+  }
+
+  .side-title {
+    padding-right: 48px;
   }
 }
 

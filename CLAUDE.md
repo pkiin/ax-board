@@ -72,8 +72,11 @@ FINNHUB_API_KEY=...
   - `GET /api/ideas`: 최신순 목록
   - `POST /api/ideas`: 추가. 세 필드 trim 후 필수값·길이 검증, 같은 `id`가 있으면 기존 행을 돌려준다(중복 저장 안 함)
   - `DELETE /api/ideas/:id`: 삭제 (없으면 404)
+  - `PATCH /api/ideas/:id` `{ proposal }`: AI 기획안 적용. 원래 제목·대상 업무·아이디어는 그대로 두고 `proposal`만 바꾼다. `validateProposal`로 검사(5개 글 항목 필수·길이, 난이도는 쉬움/보통/어려움)
   - `GET /api/health`: DB 연결 확인
   - `GET /api/ai/ping`: `OPENROUTER_API_KEY`가 읽히는지만 확인 (있으면 200 `{ ok: true, keyLoaded: true }`, 없으면 503). 키 값은 돌려주지 않는다
+  - `GET /api/ai/models`: OpenRouter 모델 목록(텍스트 출력 모델, 가격이 음수인 라우터 제외). `[{ id, name, free, inputPrice, outputPrice, contextLength }]`, 가격은 100만 토큰당 USD. 1시간 메모리 캐시, `openrouter/free` → 무료 → 이름순
+  - `POST /api/ai/refine` `{ id, model }`: DB의 아이디어를 기획안으로 다듬어 `{ proposal, model, cost }`를 돌려준다(저장 안 함). `model`은 위 목록에 있어야 한다(아니면 400, 기본 `openrouter/free`). 응답에서 JSON만 꺼내 검사하고 틀리면 한 번 더 요청. 타임아웃 60초, 실패하면 502. `model`은 실제로 응답한 모델, `cost`는 OpenRouter `usage.cost`(USD)
   - `GET /api/weather`: 기상청 초단기실황(`getUltraSrtNcst`)으로 천안(nx 62, ny 110) 현재 날씨. KST 기준 40분 전이면 한 시간 전 자료를 요청하고, 10분 동안 메모리 캐시. 키 없으면 503, 기상청 오류·타임아웃(5초)은 502. 응답 `{ location, observedAt, temperature, humidity, rain1h, precipType, windSpeed, windDir }`. 초단기실황에는 하늘상태(맑음·흐림)가 없다
   - `GET /api/news?q=검색어`: 네이버 뉴스 검색(`sort=date`, `display=3`). 검색어 trim 후 필수·50자 이하(아니면 400). 응답 `[{ title, link, date }]`, 제목의 `<b>` 태그와 HTML 엔티티는 지움, `date`는 ISO. 키 없으면 503, 네이버 오류·타임아웃(5초)은 502
   - `GET /api/stock?s=MSFT,AAPL,NVDA,GOOGL`: Finnhub 시세(쉼표로 여러 종목, 없으면 이 기본 4종목). 대문자로 바꾸고 중복 제거, 1~6개·형식 검사(아니면 400). 종목마다 따로 호출해 `[{ symbol, price, changePct, found }]`(`c`, `dp`). 값이 모두 0이거나 403(무료 플랜에서 볼 수 없는 종목)이면 `found: false`. 한 종목이 실패하면 그 줄만 `{ found: null, error }`, 모두 실패하면 502. 무료 한도(분당 60회) 때문에 종목별 1분 메모리 캐시(실패는 저장 안 함). 키 없으면 503
@@ -84,6 +87,8 @@ FINNHUB_API_KEY=...
 - `src/WeatherCard.jsx`: 날씨 카드. 로딩·에러 상태를 직접 가져 아이디어 목록과 따로 동작
 - `src/NewsCard.jsx`: 뉴스 카드. 검색어 기본값 "천안 AX", 카드 안에서 바꿔 검색. 제목은 새 탭 링크
 - `src/StockCard.jsx`: 주가 카드. 종목마다 한 줄(기호·현재가·▲▼ 등락률·삭제), 아래 입력란으로 추가(추가 전 조회해서 없는 종목이면 "찾을 수 없는 종목이에요"). 목록은 `localStorage`(`ax-board.stocks.v1`)에 저장, 기본 MSFT·AAPL·NVDA·GOOGL, 최대 6종목
+- AI로 다듬기: `IdeaCard.jsx`의 버튼 → `RefinePanel.jsx`(원래 내용과 기획안 나란히, 적용/취소). 기획안이 있으면 카드에 기획안을 보여 주고 원래 내용은 `<details>`로 접어 둔다. 항목 순서는 `src/proposal.js`
+- `src/SettingsDialog.jsx`: 헤더 오른쪽 위 톱니바퀴로 여는 설정 팝업(`<dialog>`). 모델 검색·무료만 보기, 유료 모델을 고르면 비용 경고. 고른 모델은 `src/aiSettings.js`가 `localStorage`(`ax-board.ai-model.v1`)에 저장, 유료면 카드 버튼에 "유료" 표시
 - `src/api.js`: 백엔드 호출, 예전 `localStorage`(`ax-board.ideas.v1`) 데이터를 첫 접속 때 서버로 이전 후 삭제
 - `src/IdeaForm.jsx`: 입력 폼, 세 필드(제목·대상 업무·아이디어) trim 후 필수값 검증. 저장 실패 시 입력 내용 유지
 - `src/IdeaCard.jsx`: 카드 표시와 삭제 버튼(삭제 전 확인창)
@@ -97,9 +102,12 @@ CREATE TABLE ideas (
   title      TEXT NOT NULL,
   target     TEXT NOT NULL,
   idea       TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  proposal   JSONB  -- AI 기획안 { title, summary, problem, approach, effect, difficulty }, 없으면 NULL
 );
 ```
+
+- `proposal` 열은 시작할 때 `ALTER TABLE ideas ADD COLUMN IF NOT EXISTS proposal JSONB`로 추가한다(기존 DB 호환)
 
 DB 직접 확인: `psql "$DATABASE_URL"` 또는 `psql -h /var/run/postgresql $(whoami)`
 
