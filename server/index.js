@@ -85,6 +85,71 @@ function validate(body) {
   return { value: { id, title, target, idea, createdAt } }
 }
 
+// 기상청 초단기실황 (천안 격자 nx 62, ny 110)
+const KMA_URL = 'https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getUltraSrtNcst'
+const CHEONAN = { name: '천안', nx: 62, ny: 110 }
+const WEATHER_TTL = 10 * 60 * 1000
+const PTY_TEXT = { 0: '강수 없음', 1: '비', 2: '비/눈', 3: '눈', 5: '빗방울', 6: '빗방울눈날림', 7: '눈날림' }
+const WIND_DIRS = ['북', '북동', '동', '남동', '남', '남서', '서', '북서']
+
+let weatherCache = null // { data, expiresAt }
+
+class UpstreamError extends Error {}
+
+// 매시 정각 자료가 40분쯤 뒤에 나오므로 40분 전이면 한 시간 전 자료를 요청한다.
+// 서버 시간대와 상관없이 KST 기준으로 계산한다.
+function kmaBaseTime(now = Date.now()) {
+  const kst = new Date(now + 9 * 3600_000 - 40 * 60_000)
+  return {
+    baseDate: kst.toISOString().slice(0, 10).replaceAll('-', ''),
+    baseTime: `${String(kst.getUTCHours()).padStart(2, '0')}00`,
+  }
+}
+
+async function fetchWeather() {
+  const { baseDate, baseTime } = kmaBaseTime()
+  const query = new URLSearchParams({
+    serviceKey: process.env.KMA_API_KEY.trim(),
+    pageNo: '1',
+    numOfRows: '20',
+    dataType: 'JSON',
+    base_date: baseDate,
+    base_time: baseTime,
+    nx: String(CHEONAN.nx),
+    ny: String(CHEONAN.ny),
+  })
+
+  let body
+  try {
+    const res = await fetch(`${KMA_URL}?${query}`, { signal: AbortSignal.timeout(5000) })
+    // 인증 오류 등은 dataType=JSON이어도 XML로 오므로 JSON 파싱 실패도 오류로 본다
+    body = JSON.parse(await res.text())
+  } catch (err) {
+    throw new UpstreamError(`기상청 응답을 받지 못했습니다. (${err.name})`)
+  }
+
+  const header = body?.response?.header
+  if (header?.resultCode !== '00') {
+    throw new UpstreamError(`기상청 오류: ${header?.resultMsg ?? '알 수 없는 응답'}`)
+  }
+
+  const values = {}
+  for (const item of body.response.body?.items?.item ?? []) values[item.category] = item.obsrValue
+  const num = (v) => (v === undefined || Number.isNaN(Number(v)) ? null : Number(v))
+  const vec = num(values.VEC)
+
+  return {
+    location: CHEONAN.name,
+    observedAt: `${baseDate.slice(0, 4)}-${baseDate.slice(4, 6)}-${baseDate.slice(6)}T${baseTime.slice(0, 2)}:00:00+09:00`,
+    temperature: num(values.T1H),
+    humidity: num(values.REH),
+    rain1h: num(values.RN1) ?? 0,
+    precipType: PTY_TEXT[values.PTY] ?? '알 수 없음',
+    windSpeed: num(values.WSD),
+    windDir: vec === null ? null : WIND_DIRS[Math.round(vec / 45) % 8],
+  }
+}
+
 async function handle(req, res) {
   const url = new URL(req.url, 'http://localhost')
   const path = url.pathname
@@ -125,6 +190,30 @@ async function handle(req, res) {
   if (path === '/api/health') {
     await pool.query('SELECT 1')
     return send(res, 200, { ok: true })
+  }
+
+  // OpenRouter 키가 읽히는지만 확인한다 (키 값은 응답·로그에 내보내지 않음)
+  if (path === '/api/ai/ping' && req.method === 'GET') {
+    return process.env.OPENROUTER_API_KEY?.trim()
+      ? send(res, 200, { ok: true, keyLoaded: true })
+      : send(res, 503, { ok: false, keyLoaded: false, error: 'OPENROUTER_API_KEY가 없습니다. .env 파일을 확인해 주세요.' })
+  }
+
+  // 천안 현재 날씨. 기상청 호출 한도를 아끼려고 10분 동안 메모리에 캐시한다 (키는 응답·로그에 내보내지 않음)
+  if (path === '/api/weather' && req.method === 'GET') {
+    if (!process.env.KMA_API_KEY?.trim()) {
+      return send(res, 503, { error: 'KMA_API_KEY가 없습니다. .env 파일을 확인해 주세요.' })
+    }
+    if (weatherCache && weatherCache.expiresAt > Date.now()) return send(res, 200, weatherCache.data)
+    try {
+      const data = await fetchWeather()
+      weatherCache = { data, expiresAt: Date.now() + WEATHER_TTL }
+      return send(res, 200, data)
+    } catch (err) {
+      if (!(err instanceof UpstreamError)) throw err
+      console.error(err.message)
+      return send(res, 502, { error: '날씨 정보를 가져오지 못했습니다.' })
+    }
   }
 
   send(res, 404, { error: 'Not Found' })

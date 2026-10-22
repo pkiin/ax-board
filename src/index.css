@@ -22,10 +22,85 @@ body {
   line-height: 1.6;
 }
 
+/* 왼쪽: 정보 카드(날씨·뉴스·주가), 오른쪽: 아이디어 보드 */
 .page {
-  max-width: 760px;
+  max-width: 1080px;
   margin: 0 auto;
   padding: 40px 16px 64px;
+  display: grid;
+  grid-template-columns: 260px minmax(0, 1fr);
+  gap: 32px;
+  align-items: start;
+}
+
+.side {
+  display: grid;
+  gap: 12px;
+}
+
+.widget {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px 18px;
+}
+
+.widget-title {
+  margin: 0 0 8px;
+  font-size: 0.875rem;
+  color: var(--muted);
+}
+
+.widget-message {
+  margin: 0;
+  font-size: 0.875rem;
+  color: var(--muted);
+}
+
+.widget-message.error {
+  color: var(--danger);
+}
+
+.widget-source {
+  margin: 12px 0 0;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.weather-now {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin: 0;
+}
+
+.weather-temp {
+  font-size: 2.25rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.weather-precip {
+  color: var(--muted);
+}
+
+.weather-detail {
+  display: grid;
+  grid-template-columns: repeat(3, auto);
+  justify-content: space-between;
+  gap: 8px;
+  margin: 12px 0 0;
+}
+
+.weather-detail dt {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.weather-detail dd {
+  margin: 0;
+  font-size: 0.875rem;
+  font-weight: 600;
 }
 
 .page-header h1 {
@@ -201,6 +276,14 @@ body {
   margin: 12px 0 0;
   font-size: 0.75rem;
   color: var(--muted);
+}
+
+/* 좁은 화면에서는 한 줄로 쌓고 카드 영역을 맨 위에 둔다 */
+@media (max-width: 800px) {
+  .page {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 24px;
+  }
 }
 
 @media (max-width: 480px) {
