@@ -25,8 +25,53 @@ export function deleteIdea(id) {
   return request(`/api/ideas/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 
-export function fetchModels() {
-  return request('/api/ai/models')
+// kind: text(다듬기) · vision(사진 설명) · image(이미지 그리기)
+export function fetchModels(kind = 'text') {
+  return request(`/api/ai/models?${new URLSearchParams({ kind })}`)
+}
+
+// 사진 설명·그리기는 결과만 받는다. 저장은 saveImage로 따로 한다
+export function describePhoto(id, model, image) {
+  return request('/api/ai/describe', { method: 'POST', body: JSON.stringify({ id, model, image }) })
+}
+
+export function drawImage(id, model) {
+  return request('/api/ai/draw', { method: 'POST', body: JSON.stringify({ id, model }) })
+}
+
+export function saveImage(id, { kind, image, caption, model }) {
+  return request(`/api/ideas/${encodeURIComponent(id)}/image`, {
+    method: 'PUT',
+    body: JSON.stringify({ kind, image, caption, model }),
+  })
+}
+
+export function deleteImage(id) {
+  return request(`/api/ideas/${encodeURIComponent(id)}/image`, { method: 'DELETE' })
+}
+
+// 읽어 주기: 응답이 JSON이 아니라 음성 파일이라 request를 쓰지 않는다. 재생할 주소(blob URL)를 돌려준다
+export async function speakIdea(id, model, voice) {
+  const res = await fetch('/api/ai/speak', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id, model, voice }),
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(data.error || `요청에 실패했습니다. (${res.status})`)
+  }
+  return {
+    url: URL.createObjectURL(await res.blob()),
+    model: res.headers.get('X-AI-Model') ?? model,
+    voice: res.headers.get('X-AI-Voice') || null,
+    cost: Number(res.headers.get('X-AI-Cost')) || 0,
+  }
+}
+
+// 받아쓰기: 녹음(base64)을 보내 { text, model, seconds, cost }를 받는다
+export function listenAudio({ audio, format, model }) {
+  return request('/api/ai/listen', { method: 'POST', body: JSON.stringify({ audio, format, model }) })
 }
 
 // 다듬은 결과만 받는다. 저장은 applyProposal로 따로 한다

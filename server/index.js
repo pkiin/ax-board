@@ -32,6 +32,28 @@ async function initSchema() {
   `)
   // AI로 다듬은 기획안. 이미 있는 테이블에도 열을 추가한다
   await pool.query('ALTER TABLE ideas ADD COLUMN IF NOT EXISTS proposal JSONB')
+  // 카드 대표 이미지 (카드당 한 장). 목록 응답이 무거워지지 않게 따로 두고 파일은 GET /api/ideas/:id/image로 준다
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS idea_images (
+      idea_id    TEXT PRIMARY KEY REFERENCES ideas(id) ON DELETE CASCADE,
+      kind       TEXT NOT NULL,
+      mime       TEXT NOT NULL,
+      data       BYTEA NOT NULL,
+      caption    TEXT,
+      model      TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+  `)
+}
+
+// 아이디어와 대표 이미지 정보(파일 제외)를 함께 읽는다
+const IDEA_SELECT = `
+  SELECT i.*, im.kind AS image_kind, im.caption AS image_caption, im.created_at AS image_at
+  FROM ideas i LEFT JOIN idea_images im ON im.idea_id = i.id`
+
+async function findIdea(id) {
+  const { rows } = await pool.query(`${IDEA_SELECT} WHERE i.id = $1`, [id])
+  return rows[0] ? toIdea(rows[0]) : null
 }
 
 function toIdea(row) {
@@ -42,6 +64,14 @@ function toIdea(row) {
     idea: row.idea,
     createdAt: row.created_at.toISOString(),
     proposal: row.proposal ?? null,
+    // 이미지를 바꾸면 주소가 바뀌도록 저장 시각을 붙인다 (브라우저 캐시)
+    image: row.image_kind
+      ? {
+          kind: row.image_kind,
+          caption: row.image_caption ?? null,
+          url: `/api/ideas/${encodeURIComponent(row.id)}/image?v=${row.image_at.getTime()}`,
+        }
+      : null,
   }
 }
 
@@ -50,13 +80,13 @@ function send(res, status, body) {
   res.end(body === undefined ? '' : JSON.stringify(body))
 }
 
-function readJson(req) {
+function readJson(req, limit = 100_000) {
   return new Promise((resolve, reject) => {
     let raw = ''
     req.setEncoding('utf8')
     req.on('data', (chunk) => {
       raw += chunk
-      if (raw.length > 100_000) {
+      if (raw.length > limit) {
         reject(new Error('too large'))
         req.destroy()
       }
@@ -246,6 +276,7 @@ async function getQuote(symbol) {
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1'
 const DEFAULT_MODEL = 'openrouter/free'
 const MODELS_TTL = 60 * 60 * 1000
+const MODEL_KINDS = ['text', 'vision', 'image', 'speech', 'transcription']
 const PROPOSAL_FIELDS = {
   title: { label: '제목', max: 80 },
   summary: { label: '한 줄 요약', max: 200 },
@@ -255,7 +286,37 @@ const PROPOSAL_FIELDS = {
 }
 const DIFFICULTIES = ['쉬움', '보통', '어려움']
 
-let modelsCache = null // { data, expiresAt }
+// 사진 설명·이미지 그리기·읽어 주기·받아쓰기 기본 모델. 프런트(src/aiSettings.js)와 같게 둔다
+const DEFAULT_VISION_MODEL = 'minimax/minimax-m3.1-flash:free'
+const DEFAULT_IMAGE_MODEL = 'google/gemini-3.1-flash-image'
+const DEFAULT_SPEECH_MODEL = 'elevenlabs/eleven-v4-turbo'
+// ElevenLabs 기본 목소리에는 한국어 전용이 없다. 한국어 문장을 읽혀 받아쓰기로 되돌렸을 때 원문과 같게 나온 목소리
+const DEFAULT_SPEECH_VOICE = 'sarah'
+const DEFAULT_TRANSCRIPTION_MODEL = 'openai/whisper-large-v3-turbo'
+// 1회 예상 토큰. 이미지 가격 단위가 모델마다 달라(장당·이미지 토큰당) 1024px 한 장을 1290토큰으로 어림한다
+const DESCRIBE_INPUT_TOKENS = 1500
+const DESCRIBE_OUTPUT_TOKENS = 300
+const DRAW_PROMPT_TOKENS = 150
+const DRAW_IMAGE_TOKENS = 1290
+// 읽어 주기는 글자당 가격(Gemini TTS 등은 오디오 출력 토큰 가격이 더 붙는다), 받아쓰기는 초당 가격이다
+// 1회 예상: 300글자 읽기(오디오 약 60초 = 1500토큰), 30초 받아쓰기
+const SPEAK_CHARS = 300
+const SPEAK_AUDIO_TOKENS = 1500
+const LISTEN_SECONDS = 30
+// 초당 가격 대신 토큰 가격이 붙은 받아쓰기 모델(gpt-4o-transcribe 등)은 오디오 1초 = 32토큰, 글 3토큰으로 어림한다
+const LISTEN_AUDIO_TOKENS_PER_SECOND = 32
+const LISTEN_TEXT_TOKENS_PER_SECOND = 3
+// "가장 많이 씀" 표시용. OpenRouter에 공개 API가 없어 순위 페이지에 들어 있는 사용량 데이터를 읽는다(비공식)
+const RANKING_URLS = {
+  vision: 'https://openrouter.ai/rankings',
+  image: 'https://openrouter.ai/rankings/image',
+  speech: 'https://openrouter.ai/rankings/speech',
+  transcription: 'https://openrouter.ai/rankings/transcription',
+}
+const RANKING_RETRY = 10 * 60 * 1000
+
+let catalogCache = null // { data, expiresAt } OpenRouter 모델 원본 목록
+const rankingCache = {} // { [kind]: { counts, expiresAt } }
 
 function validateProposal(input) {
   if (typeof input !== 'object' || input === null) return { error: '기획안 형식이 올바르지 않습니다.' }
@@ -272,19 +333,65 @@ function validateProposal(input) {
   return { value }
 }
 
-// 가격은 토큰당 USD 문자열로 온다. 화면에서 읽기 쉽게 100만 토큰당 USD로 바꾼다
-async function getModels() {
-  if (modelsCache && modelsCache.expiresAt > Date.now()) return modelsCache.data
+async function fetchModelList(query) {
   let body
   try {
-    const res = await fetch(`${OPENROUTER_URL}/models`, { signal: AbortSignal.timeout(10000) })
+    const res = await fetch(`${OPENROUTER_URL}/models${query}`, { signal: AbortSignal.timeout(10000) })
     body = await res.json()
     if (!res.ok || !Array.isArray(body?.data)) throw new Error(`HTTP ${res.status}`)
   } catch (err) {
     throw new UpstreamError(`OpenRouter 모델 목록을 받지 못했습니다. (${err.message})`)
   }
+  return body.data
+}
 
-  const data = body.data
+// 기본 목록에는 이미지만 내는 모델(flux 등)·음성 모델이 빠져 있어 모든 출력 종류를 받는다
+async function getCatalog() {
+  if (catalogCache && catalogCache.expiresAt > Date.now()) return catalogCache.data
+  const data = await fetchModelList('?output_modalities=all')
+  catalogCache = { data, expiresAt: Date.now() + MODELS_TTL }
+  return data
+}
+
+// 순위 페이지 안의 { model_permaslug, variant, count } 묶음을 모델별 요청 수로 더한다
+async function fetchRanking(kind) {
+  const res = await fetch(RANKING_URLS[kind], {
+    headers: { 'User-Agent': 'Mozilla/5.0' },
+    signal: AbortSignal.timeout(10000),
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const text = (await res.text()).replaceAll('\\"', '"')
+  const counts = new Map()
+  for (const [, slug, variant, count] of text.matchAll(/"model_permaslug":"([^"]+)","variant":"([^"]+)"[^{}]*?"count":(\d+)/g)) {
+    const key = `${slug}|${variant}`
+    counts.set(key, (counts.get(key) ?? 0) + Number(count))
+  }
+  if (counts.size === 0) throw new Error('사용량 데이터를 찾지 못함')
+  return counts
+}
+
+// 실패해도 배지만 빠지고 목록은 보여 준다. 실패하면 10분 뒤에 다시 시도한다
+async function getRanking(kind) {
+  const cached = rankingCache[kind]
+  if (cached && cached.expiresAt > Date.now()) return cached.counts
+  let counts
+  try {
+    counts = await fetchRanking(kind)
+    rankingCache[kind] = { counts, expiresAt: Date.now() + MODELS_TTL }
+  } catch (err) {
+    console.error(`OpenRouter 순위를 읽지 못했습니다. (${kind}, ${err.message})`)
+    counts = new Map()
+    rankingCache[kind] = { counts, expiresAt: Date.now() + RANKING_RETRY }
+  }
+  return counts
+}
+
+// 가격은 토큰당 USD 문자열로 온다. 화면에서 읽기 쉽게 100만 토큰당 USD로 바꾼다
+// kind: text(다듬기) · vision(사진 설명, 이미지 입력 → 글) · image(이미지 그리기, 이미지 출력)
+async function getModels(kind = 'text') {
+  if (kind !== 'text') return getMediaModels(kind)
+  const catalog = await getCatalog()
+  return catalog
     .filter((m) => m.architecture?.output_modalities?.includes('text'))
     .map((m) => {
       const input = Number(m.pricing?.prompt)
@@ -301,9 +408,82 @@ async function getModels() {
     // 가격이 정해지지 않은 라우터(-1 등)는 비용을 미리 알 수 없으므로 뺀다
     .filter((m) => m.inputPrice >= 0 && m.outputPrice >= 0)
     .sort((a, b) => (a.id === DEFAULT_MODEL ? -1 : b.id === DEFAULT_MODEL ? 1 : b.free - a.free || a.name.localeCompare(b.name)))
+}
 
-  modelsCache = { data, expiresAt: Date.now() + MODELS_TTL }
+// 받아쓰기 초당 가격(USD). 토큰 가격 모델은 어림값
+function secondPrice(input, output) {
+  return output > 0 ? LISTEN_AUDIO_TOKENS_PER_SECOND * input + LISTEN_TEXT_TOKENS_PER_SECOND * output : input
+}
+
+// 종류별 걸러 내기와 1회 예상 비용(USD). price(key)는 pricing의 토큰(글자·초)당 USD
+const MEDIA_KINDS = {
+  // 사진 설명은 글만 내는 모델로 한정한다 (음악·이미지를 함께 내는 모델 제외)
+  vision: {
+    defaultId: DEFAULT_VISION_MODEL,
+    match: (inputs, outputs) => inputs.includes('image') && outputs.length > 0 && outputs.every((o) => o === 'text'),
+    estimate: (price) => DESCRIBE_INPUT_TOKENS * price('prompt') + DESCRIBE_OUTPUT_TOKENS * price('completion'),
+  },
+  image: {
+    defaultId: DEFAULT_IMAGE_MODEL,
+    match: (inputs, outputs) => outputs.includes('image'),
+    estimate: (price) => DRAW_PROMPT_TOKENS * price('prompt') + DRAW_IMAGE_TOKENS * price('image_output'),
+  },
+  speech: {
+    defaultId: DEFAULT_SPEECH_MODEL,
+    match: (inputs, outputs) => outputs.includes('speech'),
+    estimate: (price) => SPEAK_CHARS * price('prompt') + SPEAK_AUDIO_TOKENS * price('completion'),
+  },
+  transcription: {
+    defaultId: DEFAULT_TRANSCRIPTION_MODEL,
+    match: (inputs, outputs) => outputs.includes('transcription'),
+    estimate: (price) => LISTEN_SECONDS * secondPrice(price('prompt'), price('completion')),
+  },
+}
+
+// 미디어 모델. 1회 예상 비용(estimate, USD)과 기본(default)·가장 저렴(cheapest)·가장 많이 씀(popular)을 함께 준다
+// 읽어 주기는 목소리 목록(voices)과 기본 목소리(defaultVoice), 받아쓰기는 초당 가격(secondPrice)을 더 준다
+async function getMediaModels(kind) {
+  const config = MEDIA_KINDS[kind]
+  const [catalog, ranking] = await Promise.all([getCatalog(), getRanking(kind)])
+  const data = catalog
+    .filter((m) => config.match(m.architecture?.input_modalities ?? [], m.architecture?.output_modalities ?? []))
+    .map((m) => {
+      const price = (key) => Number(m.pricing?.[key] ?? 0)
+      const input = price('prompt')
+      const output = price('completion')
+      // 순위의 모델 이름은 canonical_slug와 같고, 무료판은 variant가 free로 따로 잡힌다
+      const variant = m.id.endsWith(':free') ? 'free' : 'standard'
+      const model = {
+        id: m.id,
+        name: m.name,
+        // 이미지 모델은 글 가격이 0이어도 이미지 가격이 붙으므로 모든 가격이 0일 때만 무료
+        free: Object.values(m.pricing ?? {}).every((v) => Number(v) === 0),
+        inputPrice: input * 1_000_000,
+        outputPrice: output * 1_000_000,
+        estimate: config.estimate(price),
+        default: m.id === config.defaultId,
+        usage: ranking.get(`${m.canonical_slug}|${variant}`) ?? 0,
+        outputs: m.architecture.output_modalities,
+        valid: input >= 0 && output >= 0 && price('image_output') >= 0,
+      }
+      if (kind === 'speech') {
+        model.voices = Array.isArray(m.supported_voices) ? m.supported_voices : []
+        // ElevenLabs 계열은 같은 목소리 이름을 쓰므로 기본 목소리가 있으면 그것, 없으면 목록의 첫 번째
+        model.defaultVoice = model.voices.includes(DEFAULT_SPEECH_VOICE) ? DEFAULT_SPEECH_VOICE : (model.voices[0] ?? null)
+      }
+      if (kind === 'transcription') model.secondPrice = secondPrice(input, output)
+      return model
+    })
+    .filter((m) => m.valid)
+
+  // 값이 같으면 기본 모델을 고른다
+  const cheapest = data.filter((m) => !m.free && m.estimate > 0).sort((a, b) => a.estimate - b.estimate || b.default - a.default)[0]
+  const popular = data.filter((m) => m.usage > 0).sort((a, b) => b.usage - a.usage)[0]
+  // 기본 → 가장 많이 씀 → 가장 저렴 → 무료 → 이름순
+  const rank = (m) => (m.default ? 0 : m.popular ? 1 : m.cheapest ? 2 : m.free ? 3 : 4)
   return data
+    .map(({ valid, usage, ...rest }) => ({ ...rest, cheapest: rest.id === cheapest?.id, popular: rest.id === popular?.id }))
+    .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name))
 }
 
 const REFINE_PROMPT = `너는 사내 AI 활용(AX) 아이디어를 짧은 기획안으로 다듬는 기획자다.
@@ -338,26 +518,7 @@ async function refineIdea(idea, model) {
   let cost = 0
   // 무료 라우터는 매번 다른 모델로 연결되어 형식이 틀릴 수 있어 한 번 더 시도한다
   for (let attempt = 0; attempt < 2; attempt++) {
-    let res
-    let body
-    try {
-      res = await fetch(`${OPENROUTER_URL}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${process.env.OPENROUTER_API_KEY.trim()}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ model, messages, usage: { include: true } }),
-        signal: AbortSignal.timeout(60000),
-      })
-      body = await res.json()
-    } catch (err) {
-      throw new UpstreamError(`OpenRouter 응답을 받지 못했습니다. (${err.name})`)
-    }
-    if (!res.ok || body?.error) {
-      throw new UpstreamError(`OpenRouter 오류 (${res.status}): ${body?.error?.message ?? '알 수 없는 응답'}`)
-    }
-
+    const body = await callOpenRouter({ model, messages }, 60000)
     cost += Number(body.usage?.cost) || 0
     const { value, error } = parseProposal(body.choices?.[0]?.message?.content)
     if (value) return { proposal: value, model: body.model ?? model, cost }
@@ -366,12 +527,179 @@ async function refineIdea(idea, model) {
   throw new UpstreamError(lastError)
 }
 
+// 대표 이미지. 프런트(src/image.js)와 같은 규칙: jpeg·png·webp, 저장은 1.5MB 이하, 설명은 200자 이하
+const IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp']
+const MAX_IMAGE_BYTES = 1_500_000
+const MAX_CAPTION = 200
+const IMAGE_BODY_LIMIT = 2_500_000
+
+// data URL을 { mime, data(Buffer) }로 바꾼다
+function parseDataUrl(input) {
+  const match = typeof input === 'string' ? input.match(/^data:([\w/+.-]+);base64,([A-Za-z0-9+/=]+)$/) : null
+  if (!match || !IMAGE_TYPES.includes(match[1])) return { error: '이미지는 JPG, PNG, WebP만 올릴 수 있습니다.' }
+  const data = Buffer.from(match[2], 'base64')
+  if (data.length === 0) return { error: '이미지가 비어 있습니다.' }
+  if (data.length > MAX_IMAGE_BYTES) return { error: '이미지가 너무 큽니다.' }
+  return { value: { mime: match[1], data } }
+}
+
+function callOpenRouter(payload, timeout) {
+  return callOpenRouterPath('/chat/completions', { ...payload, usage: { include: true } }, timeout)
+}
+
+async function callOpenRouterPath(path, payload, timeout) {
+  let res
+  let body
+  try {
+    res = await fetch(`${OPENROUTER_URL}${path}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY.trim()}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(timeout),
+    })
+    body = await res.json()
+  } catch (err) {
+    throw new UpstreamError(`OpenRouter 응답을 받지 못했습니다. (${err.name})`)
+  }
+  if (!res.ok || body?.error) {
+    throw new UpstreamError(`OpenRouter 오류 (${res.status}): ${body?.error?.message ?? '알 수 없는 응답'}`)
+  }
+  return body
+}
+
+const DESCRIBE_PROMPT = `사진에 보이는 내용을 한국어 한 문장으로 설명한다.
+사진에 보이는 것만 쓰고 추측하지 않는다. 100자 안팎으로 쓰고, 문장 하나만 출력한다. 따옴표나 다른 설명은 붙이지 않는다.`
+
+// 모델이 따옴표·줄바꿈을 붙여도 첫 줄만 깔끔하게 꺼낸다
+function parseCaption(content) {
+  const line = (typeof content === 'string' ? content : '').trim().split('\n')[0].trim()
+  const text = line.replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim()
+  if (!text) return { error: '설명을 받지 못했습니다.' }
+  if (text.length > MAX_CAPTION) return { error: '설명이 너무 깁니다.' }
+  return { value: text }
+}
+
+async function describePhoto(image, model) {
+  const messages = [
+    { role: 'system', content: DESCRIBE_PROMPT },
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: '이 사진을 한 문장으로 설명해 줘.' },
+        { type: 'image_url', image_url: { url: image } },
+      ],
+    },
+  ]
+  let lastError = ''
+  let cost = 0
+  // 다듬기와 같이 형식이 틀리면 한 번 더 시도한다
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const body = await callOpenRouter({ model, messages }, 60000)
+    cost += Number(body.usage?.cost) || 0
+    const { value, error } = parseCaption(body.choices?.[0]?.message?.content)
+    if (value) return { caption: value, model: body.model ?? model, cost }
+    lastError = `${error} (${body.model ?? model})`
+  }
+  throw new UpstreamError(lastError)
+}
+
+// 비용이 드는 호출이라 다시 시도하지 않는다. 이미지만 내는 모델은 modalities에 text를 넣으면 거절한다
+async function drawImage(idea, model) {
+  const title = idea.proposal?.title ?? idea.title
+  const prompt = `Create a representative illustration for an idea card.
+Card title (Korean): "${title}"
+Work area (Korean): "${idea.target}"
+Show the idea visually in a clean, modern flat illustration style with a simple background.
+Square composition. Do not include any text, letters, numbers, or logos in the image.`
+  const body = await callOpenRouter(
+    {
+      model: model.id,
+      messages: [{ role: 'user', content: prompt }],
+      modalities: model.outputs.includes('text') ? ['image', 'text'] : ['image'],
+    },
+    120000,
+  )
+  const cost = Number(body.usage?.cost) || 0
+  let url = body.choices?.[0]?.message?.images?.[0]?.image_url?.url
+  if (typeof url !== 'string') throw new UpstreamError(`이미지를 받지 못했습니다. (${body.model ?? model.id})`)
+
+  // 주소로 오는 경우에는 받아서 data URL로 바꾼다
+  if (/^https?:\/\//.test(url)) {
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(20000) })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const mime = res.headers.get('content-type')?.split(';')[0] ?? 'image/png'
+      url = `data:${mime};base64,${Buffer.from(await res.arrayBuffer()).toString('base64')}`
+    } catch (err) {
+      throw new UpstreamError(`생성된 이미지를 내려받지 못했습니다. (${err.message})`)
+    }
+  }
+  if (!url.startsWith('data:image/')) throw new UpstreamError(`이미지 형식이 올바르지 않습니다. (${body.model ?? model.id})`)
+  return { image: url, model: body.model ?? model.id, cost }
+}
+
+// 읽어 주기·받아쓰기. 프런트(src/audio.js)와 같은 규칙: 녹음은 60초·3MB 이하, 형식은 아래 목록
+const MAX_SPEAK_CHARS = 500
+const AUDIO_FORMATS = ['webm', 'ogg', 'm4a', 'mp3', 'wav']
+const MAX_AUDIO_BYTES = 3_000_000
+const AUDIO_BODY_LIMIT = 4_500_000
+
+// 카드에서 읽을 글: 제목과 (기획안이 있으면) 한 줄 요약, 없으면 아이디어. 비용 때문에 500자에서 자른다
+function speechText(idea) {
+  const text = idea.proposal
+    ? `${idea.proposal.title}. ${idea.proposal.summary}`
+    : `${idea.title}. ${idea.idea}`
+  return text.length > MAX_SPEAK_CHARS ? text.slice(0, MAX_SPEAK_CHARS) : text
+}
+
+// 응답은 음성 파일(mp3)이다. 비용은 응답에 없어서 글자 수로 계산한다(오디오 토큰 가격이 붙는 모델은 어림값)
+async function speakText(text, model, voice) {
+  let res
+  try {
+    res = await fetch(`${OPENROUTER_URL}/audio/speech`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.OPENROUTER_API_KEY.trim()}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ model: model.id, input: text, ...(voice && { voice }), response_format: 'mp3' }),
+      signal: AbortSignal.timeout(60000),
+    })
+  } catch (err) {
+    throw new UpstreamError(`OpenRouter 응답을 받지 못했습니다. (${err.name})`)
+  }
+  if (!res.ok) {
+    const body = await res.json().catch(() => null)
+    throw new UpstreamError(`OpenRouter 오류 (${res.status}): ${body?.error?.message ?? '알 수 없는 응답'}`)
+  }
+  let audio
+  try {
+    audio = Buffer.from(await res.arrayBuffer())
+  } catch (err) {
+    throw new UpstreamError(`음성을 받지 못했습니다. (${err.name})`)
+  }
+  if (audio.length === 0) throw new UpstreamError(`음성이 비어 있습니다. (${model.id})`)
+  const audioTokens = SPEAK_AUDIO_TOKENS * (text.length / SPEAK_CHARS)
+  const cost = (text.length * model.inputPrice + audioTokens * model.outputPrice) / 1_000_000
+  return { audio, mime: res.headers.get('content-type')?.split(';')[0] || 'audio/mpeg', cost }
+}
+
+async function transcribeAudio(data, format, model) {
+  const body = await callOpenRouterPath('/audio/transcriptions', { model, input_audio: { data, format }, language: 'ko' }, 60000)
+  const text = typeof body.text === 'string' ? body.text.trim() : ''
+  if (!text) throw new UpstreamError(`받아쓴 내용이 없습니다. (${model})`)
+  return { text, model, seconds: Number(body.usage?.seconds) || null, cost: Number(body.usage?.cost) || 0 }
+}
+
 async function handle(req, res) {
   const url = new URL(req.url, 'http://localhost')
   const path = url.pathname
 
   if (path === '/api/ideas' && req.method === 'GET') {
-    const { rows } = await pool.query('SELECT * FROM ideas ORDER BY created_at DESC')
+    const { rows } = await pool.query(`${IDEA_SELECT} ORDER BY i.created_at DESC`)
     return send(res, 200, rows.map(toIdea))
   }
 
@@ -413,11 +741,62 @@ async function handle(req, res) {
     }
     const { value, error } = validateProposal(body?.proposal)
     if (error) return send(res, 400, { error })
-    const { rows } = await pool.query('UPDATE ideas SET proposal = $2 WHERE id = $1 RETURNING *', [
-      decodeURIComponent(match[1]),
-      value,
+    const id = decodeURIComponent(match[1])
+    const { rowCount } = await pool.query('UPDATE ideas SET proposal = $2 WHERE id = $1', [id, value])
+    return rowCount ? send(res, 200, await findIdea(id)) : send(res, 404, { error: '아이디어를 찾을 수 없습니다.' })
+  }
+
+  // 대표 이미지: 파일 보기(GET) · 적용(PUT) · 지우기(DELETE)
+  const imageMatch = path.match(/^\/api\/ideas\/([^/]+)\/image$/)
+  if (imageMatch && req.method === 'GET') {
+    const { rows } = await pool.query('SELECT mime, data FROM idea_images WHERE idea_id = $1', [
+      decodeURIComponent(imageMatch[1]),
     ])
-    return rows[0] ? send(res, 200, toIdea(rows[0])) : send(res, 404, { error: '아이디어를 찾을 수 없습니다.' })
+    if (!rows[0]) return send(res, 404, { error: '이미지가 없습니다.' })
+    // 주소에 저장 시각(v)이 붙어 있어 이미지가 바뀌면 주소도 바뀐다
+    res.writeHead(200, { 'Content-Type': rows[0].mime, 'Cache-Control': 'private, max-age=31536000, immutable' })
+    return res.end(rows[0].data)
+  }
+
+  // 미리보기에서 적용을 누르면 저장한다. 카드당 한 장이라 이전 이미지는 바뀐다
+  if (imageMatch && req.method === 'PUT') {
+    let body
+    try {
+      body = await readJson(req, IMAGE_BODY_LIMIT)
+    } catch {
+      return send(res, 400, { error: '요청 형식이 올바르지 않거나 이미지가 너무 큽니다.' })
+    }
+    const kind = body?.kind
+    if (kind !== 'photo' && kind !== 'generated') return send(res, 400, { error: '이미지 종류가 올바르지 않습니다.' })
+    const { value: image, error } = parseDataUrl(body.image)
+    if (error) return send(res, 400, { error })
+    let caption = null
+    if (kind === 'photo') {
+      caption = typeof body.caption === 'string' ? body.caption.trim() : ''
+      if (!caption) return send(res, 400, { error: '사진 설명이 비어 있습니다.' })
+      if (caption.length > MAX_CAPTION) return send(res, 400, { error: `사진 설명은 ${MAX_CAPTION}자 이하여야 합니다.` })
+    }
+    const model = typeof body.model === 'string' ? body.model.slice(0, 200) : null
+
+    const id = decodeURIComponent(imageMatch[1])
+    const { rowCount } = await pool.query('SELECT 1 FROM ideas WHERE id = $1', [id])
+    if (!rowCount) return send(res, 404, { error: '아이디어를 찾을 수 없습니다.' })
+    await pool.query(
+      `INSERT INTO idea_images (idea_id, kind, mime, data, caption, model)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (idea_id) DO UPDATE SET
+         kind = EXCLUDED.kind, mime = EXCLUDED.mime, data = EXCLUDED.data,
+         caption = EXCLUDED.caption, model = EXCLUDED.model, created_at = now()`,
+      [id, kind, image.mime, image.data, caption, model],
+    )
+    return send(res, 200, await findIdea(id))
+  }
+
+  if (imageMatch && req.method === 'DELETE') {
+    const id = decodeURIComponent(imageMatch[1])
+    await pool.query('DELETE FROM idea_images WHERE idea_id = $1', [id])
+    const idea = await findIdea(id)
+    return idea ? send(res, 200, idea) : send(res, 404, { error: '아이디어를 찾을 수 없습니다.' })
   }
 
   if (path === '/api/health') {
@@ -433,9 +812,12 @@ async function handle(req, res) {
   }
 
   // 설정 팝업용 모델·가격 목록 (1시간 캐시, 목록 조회에는 키가 필요 없다)
+  // type(또는 kind)=text(기본, 다듬기) · vision(사진 설명) · image(이미지 그리기) · speech(읽어 주기) · transcription(받아쓰기)
   if (path === '/api/ai/models' && req.method === 'GET') {
+    const kind = url.searchParams.get('type') || url.searchParams.get('kind') || 'text'
+    if (!MODEL_KINDS.includes(kind)) return send(res, 400, { error: '모델 종류가 올바르지 않습니다.' })
     try {
-      return send(res, 200, await getModels())
+      return send(res, 200, await getModels(kind))
     } catch (err) {
       if (!(err instanceof UpstreamError)) throw err
       console.error(err.message)
@@ -470,6 +852,114 @@ async function handle(req, res) {
       if (!(err instanceof UpstreamError)) throw err
       console.error(err.message)
       return send(res, 502, { error: 'AI로 다듬지 못했습니다. 잠시 후 다시 시도해 주세요.' })
+    }
+  }
+
+  // 사진 설명(describe)·이미지 그리기(draw). 저장하지 않고 결과만 돌려준다 (적용은 PUT /api/ideas/:id/image)
+  if ((path === '/api/ai/describe' || path === '/api/ai/draw') && req.method === 'POST') {
+    if (!process.env.OPENROUTER_API_KEY?.trim()) {
+      return send(res, 503, { error: 'OPENROUTER_API_KEY가 없습니다. .env 파일을 확인해 주세요.' })
+    }
+    const describing = path === '/api/ai/describe'
+    let body
+    try {
+      body = await readJson(req, describing ? IMAGE_BODY_LIMIT : undefined)
+    } catch {
+      return send(res, 400, { error: '요청 형식이 올바르지 않거나 이미지가 너무 큽니다.' })
+    }
+    const fallback = describing ? DEFAULT_VISION_MODEL : DEFAULT_IMAGE_MODEL
+    const modelId = typeof body?.model === 'string' && body.model ? body.model : fallback
+    if (describing) {
+      const { error } = parseDataUrl(body?.image)
+      if (error) return send(res, 400, { error })
+    }
+
+    try {
+      // 목록에 있는 모델만 호출한다 (아무 이름이나 받아 비용이 드는 호출을 막는다)
+      const model = (await getModels(describing ? 'vision' : 'image')).find((m) => m.id === modelId)
+      if (!model) return send(res, 400, { error: '사용할 수 없는 모델입니다.' })
+
+      const { rows } = await pool.query('SELECT * FROM ideas WHERE id = $1', [String(body?.id ?? '')])
+      if (!rows[0]) return send(res, 404, { error: '아이디어를 찾을 수 없습니다.' })
+
+      return send(res, 200, describing ? await describePhoto(body.image, model.id) : await drawImage(rows[0], model))
+    } catch (err) {
+      if (!(err instanceof UpstreamError)) throw err
+      console.error(err.message)
+      return send(res, 502, {
+        error: describing ? '사진을 설명하지 못했습니다. 잠시 후 다시 시도해 주세요.' : '이미지를 그리지 못했습니다. 잠시 후 다시 시도해 주세요.',
+      })
+    }
+  }
+
+  // 카드 읽어 주기. 화면이 보낸 글이 아니라 DB의 카드 내용을 읽고, 응답은 음성 파일(mp3)이다
+  if (path === '/api/ai/speak' && req.method === 'POST') {
+    if (!process.env.OPENROUTER_API_KEY?.trim()) {
+      return send(res, 503, { error: 'OPENROUTER_API_KEY가 없습니다. .env 파일을 확인해 주세요.' })
+    }
+    let body
+    try {
+      body = await readJson(req)
+    } catch {
+      return send(res, 400, { error: '요청 형식이 올바르지 않습니다.' })
+    }
+    const modelId = typeof body?.model === 'string' && body.model ? body.model : DEFAULT_SPEECH_MODEL
+
+    try {
+      // 모델·목소리는 목록에 있는 것만 받는다. 목소리 목록이 없는 모델은 목소리를 보내지 않는다
+      const model = (await getModels('speech')).find((m) => m.id === modelId)
+      if (!model) return send(res, 400, { error: '사용할 수 없는 모델입니다.' })
+      let voice = null
+      if (model.voices.length > 0) {
+        voice = typeof body.voice === 'string' && body.voice ? body.voice : model.defaultVoice
+        if (!model.voices.includes(voice)) return send(res, 400, { error: '이 모델에서 쓸 수 없는 목소리입니다.' })
+      }
+
+      const { rows } = await pool.query('SELECT * FROM ideas WHERE id = $1', [String(body?.id ?? '')])
+      if (!rows[0]) return send(res, 404, { error: '아이디어를 찾을 수 없습니다.' })
+
+      const { audio, mime, cost } = await speakText(speechText(rows[0]), model, voice)
+      res.writeHead(200, {
+        'Content-Type': mime,
+        'Content-Length': audio.length,
+        'X-AI-Model': model.id,
+        'X-AI-Voice': voice ?? '',
+        'X-AI-Cost': String(cost),
+      })
+      return res.end(audio)
+    } catch (err) {
+      if (!(err instanceof UpstreamError)) throw err
+      console.error(err.message)
+      return send(res, 502, { error: '읽어 주지 못했습니다. 잠시 후 다시 시도해 주세요.' })
+    }
+  }
+
+  // 받아쓰기. 녹음(base64)을 글로 바꿔 돌려준다 (새 카드 입력란에 넣는 것은 화면이 한다)
+  if (path === '/api/ai/listen' && req.method === 'POST') {
+    if (!process.env.OPENROUTER_API_KEY?.trim()) {
+      return send(res, 503, { error: 'OPENROUTER_API_KEY가 없습니다. .env 파일을 확인해 주세요.' })
+    }
+    let body
+    try {
+      body = await readJson(req, AUDIO_BODY_LIMIT)
+    } catch {
+      return send(res, 400, { error: '요청 형식이 올바르지 않거나 녹음이 너무 깁니다.' })
+    }
+    const modelId = typeof body?.model === 'string' && body.model ? body.model : DEFAULT_TRANSCRIPTION_MODEL
+    if (!AUDIO_FORMATS.includes(body?.format)) return send(res, 400, { error: '지원하지 않는 녹음 형식입니다.' })
+    const audio = typeof body.audio === 'string' && /^[A-Za-z0-9+/=]+$/.test(body.audio) ? body.audio : ''
+    const bytes = Math.floor((audio.length * 3) / 4)
+    if (!bytes) return send(res, 400, { error: '녹음이 비어 있습니다.' })
+    if (bytes > MAX_AUDIO_BYTES) return send(res, 400, { error: '녹음이 너무 깁니다.' })
+
+    try {
+      const models = await getModels('transcription')
+      if (!models.some((m) => m.id === modelId)) return send(res, 400, { error: '사용할 수 없는 모델입니다.' })
+      return send(res, 200, await transcribeAudio(audio, body.format, modelId))
+    } catch (err) {
+      if (!(err instanceof UpstreamError)) throw err
+      console.error(err.message)
+      return send(res, 502, { error: '받아쓰지 못했습니다. 잠시 후 다시 시도해 주세요.' })
     }
   }
 
