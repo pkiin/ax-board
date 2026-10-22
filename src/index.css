@@ -899,6 +899,78 @@ body {
   color: var(--muted);
 }
 
+/* 오늘의 브리핑 */
+.briefing-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.briefing-button:hover:not(:disabled) {
+  filter: brightness(0.95);
+}
+
+.briefing-button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.briefing .widget-message {
+  margin-top: 10px;
+}
+
+.briefing-sources {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.briefing-sources li {
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.briefing-sources .ok {
+  background: #ecfdf3;
+  color: #067647;
+}
+
+.briefing-sources .missing {
+  background: #f2f4f7;
+  color: var(--muted);
+}
+
+.briefing-text {
+  margin: 10px 0 0;
+  font-size: 0.875rem;
+  line-height: 1.65;
+  word-break: keep-all;
+  overflow-wrap: anywhere;
+}
+
+.briefing-audio {
+  display: block;
+  width: 100%;
+  height: 36px;
+  margin-top: 10px;
+}
+
 /* 읽어 주기 */
 .speech {
   margin-top: 10px;

@@ -183,6 +183,14 @@ async function fetchWeather() {
   }
 }
 
+// 날씨 라우트와 브리핑이 함께 쓴다. 기상청 호출 한도를 아끼려고 10분 동안 메모리에 캐시한다
+async function getWeather() {
+  if (weatherCache && weatherCache.expiresAt > Date.now()) return weatherCache.data
+  const data = await fetchWeather()
+  weatherCache = { data, expiresAt: Date.now() + WEATHER_TTL }
+  return data
+}
+
 // 네이버 뉴스 검색 (최신순 3건)
 const NAVER_NEWS_URL = 'https://openapi.naver.com/v1/search/news.json'
 const MAX_QUERY = 50
@@ -687,6 +695,122 @@ async function speakText(text, model, voice) {
   return { audio, mime: res.headers.get('content-type')?.split(';')[0] || 'audio/mpeg', cost }
 }
 
+// 출근길 브리핑: 날씨·뉴스·주가를 동시에 모아 글로 쓰고 음성으로 만든다
+// 뉴스 검색어는 뉴스 카드 기본값과 같다
+const BRIEFING_NEWS_QUERY = '천안 AX'
+const MAX_BRIEFING_SENTENCES = 4
+
+// 키가 없으면 그 정보만 빠지도록 UpstreamError로 던진다
+function requireKeys(...names) {
+  const missing = names.filter((name) => !process.env[name]?.trim())
+  if (missing.length > 0) throw new UpstreamError(`${missing.join(', ')}가 없습니다.`)
+}
+
+// 셋을 동시에 부르고, 실패한 것은 null(정보 없음)로 둔다
+async function gatherBriefing(symbols, query) {
+  const [weather, news, stocks] = await Promise.allSettled([
+    (async () => {
+      requireKeys('KMA_API_KEY')
+      return getWeather()
+    })(),
+    (async () => {
+      requireKeys('NAVER_CLIENT_ID', 'NAVER_CLIENT_SECRET')
+      const items = await fetchNews(query)
+      if (items.length === 0) throw new UpstreamError(`"${query}" 뉴스가 없습니다.`)
+      return items
+    })(),
+    (async () => {
+      requireKeys('FINNHUB_API_KEY')
+      // getQuote는 종목별로 실패를 error로 돌려주므로, 찾은 종목만 쓴다
+      const quotes = (await Promise.all(symbols.map(getQuote))).filter((q) => q.found)
+      if (quotes.length === 0) throw new UpstreamError('브리핑에 쓸 시세가 없습니다.')
+      return quotes
+    })(),
+  ])
+  const pick = (result, label) => {
+    if (result.status === 'fulfilled') return result.value
+    if (!(result.reason instanceof UpstreamError)) throw result.reason
+    console.error(`브리핑 ${label}: ${result.reason.message}`)
+    return null
+  }
+  return { weather: pick(weather, '날씨'), news: pick(news, '뉴스'), stocks: pick(stocks, '주가') }
+}
+
+function briefingFacts({ weather, news, stocks }, query) {
+  const sign = (v) => `${v > 0 ? '+' : ''}${v.toFixed(2)}%`
+  const weatherLine = weather
+    ? `날씨(${weather.location}, ${weather.observedAt.slice(11, 13)}시 관측): 기온 ${weather.temperature ?? '-'}도, ${weather.precipType}, ` +
+      `습도 ${weather.humidity ?? '-'}%, 바람 ${weather.windDir ?? ''} ${weather.windSpeed ?? '-'}m/s, 1시간 강수량 ${weather.rain1h}mm`
+    : '날씨: 정보 없음'
+  const newsLines = news ? [`뉴스("${query}" 최신순):`, ...news.map((n) => `- ${n.title}`)] : ['뉴스: 정보 없음']
+  const stockLines = stocks
+    ? ['주가(미국 주식, 가격 단위 달러, 전일 종가 대비):', ...stocks.map((s) => `- ${s.symbol} $${s.price.toFixed(2)} (${sign(s.changePct)})`)]
+    : ['주가: 정보 없음']
+  return [weatherLine, ...newsLines, ...stockLines].join('\n')
+}
+
+const BRIEFING_PROMPT = `너는 회사 사람들에게 출근길 브리핑을 읽어 주는 진행자다.
+주어진 정보만 써서 한국어 한 단락, ${MAX_BRIEFING_SENTENCES}문장 이내로 브리핑을 쓴다.
+- 날씨, 뉴스, 주가 순서로 핵심만 짚는다. 주가는 오르고 내린 흐름 위주로 짧게 말하고, 가격을 말할 때는 단위(달러)를 바꾸지 않는다.
+- "정보 없음"인 항목은 지어내지 말고 "OO 정보 없음"이라고 짧게 밝힌다.
+- 소리 내어 읽을 글이므로 목록, 기호, 이모지, 마크다운, 따옴표를 쓰지 않는다.
+- 한국어로만 쓰고 한자나 다른 언어를 섞지 않는다(종목 기호는 그대로 둔다).
+브리핑 글만 출력한다.`
+
+// 줄을 한 단락으로 합치고 앞 4문장만 남긴다. 소수점(1.32)은 뒤에 공백이 없어 문장으로 나뉘지 않는다
+function parseBriefing(content) {
+  const paragraph = (typeof content === 'string' ? content : '')
+    .replace(/[*#`>]/g, '')
+    .split('\n')
+    .map((line) => line.replace(/^\s*[-•]\s*/, '').trim())
+    .filter(Boolean)
+    .join(' ')
+    .replace(/^["'“”‘’]+|["'“”‘’]+$/g, '')
+    .trim()
+  if (!paragraph) return { error: '브리핑 글을 받지 못했습니다.' }
+  const text = paragraph.split(/(?<=[.!?])\s+/).slice(0, MAX_BRIEFING_SENTENCES).join(' ')
+  // 읽어 주기와 같은 한도. 넘으면 다시 쓰게 한다
+  if (text.length > MAX_SPEAK_CHARS) return { error: '브리핑 글이 너무 깁니다.' }
+  return { value: text }
+}
+
+async function writeBriefing(facts, model) {
+  const messages = [
+    { role: 'system', content: BRIEFING_PROMPT },
+    { role: 'user', content: `오늘 정보:\n${facts}` },
+  ]
+  let lastError = ''
+  let cost = 0
+  // 무료 라우터는 매번 다른 모델로 연결되어 응답이 늦거나 형식이 틀릴 수 있다.
+  // 시간 초과·오류·형식 오류 모두 한 번 더 시도하고, 시도마다 45초를 넘기지 않는다
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let body
+    try {
+      body = await callOpenRouter({ model, messages }, 45000)
+    } catch (err) {
+      if (!(err instanceof UpstreamError)) throw err
+      lastError = err.message
+      console.error(`브리핑 글 (${attempt + 1}번째): ${err.message}`)
+      continue
+    }
+    cost += Number(body.usage?.cost) || 0
+    const { value, error } = parseBriefing(body.choices?.[0]?.message?.content)
+    if (value) return { text: value, model: body.model ?? model, cost }
+    lastError = `${error} (${body.model ?? model})`
+  }
+  throw new UpstreamError(lastError)
+}
+
+// 읽어 주기 모델·목소리는 목록에 있는 것만 받는다. 목소리 목록이 없는 모델은 목소리를 보내지 않는다
+async function resolveSpeech(modelId, voiceInput) {
+  const model = (await getModels('speech')).find((m) => m.id === modelId)
+  if (!model) return { error: '사용할 수 없는 모델입니다.' }
+  if (model.voices.length === 0) return { model, voice: null }
+  const voice = typeof voiceInput === 'string' && voiceInput ? voiceInput : model.defaultVoice
+  if (!model.voices.includes(voice)) return { error: '이 모델에서 쓸 수 없는 목소리입니다.' }
+  return { model, voice }
+}
+
 async function transcribeAudio(data, format, model) {
   const body = await callOpenRouterPath('/audio/transcriptions', { model, input_audio: { data, format }, language: 'ko' }, 60000)
   const text = typeof body.text === 'string' ? body.text.trim() : ''
@@ -906,14 +1030,8 @@ async function handle(req, res) {
     const modelId = typeof body?.model === 'string' && body.model ? body.model : DEFAULT_SPEECH_MODEL
 
     try {
-      // 모델·목소리는 목록에 있는 것만 받는다. 목소리 목록이 없는 모델은 목소리를 보내지 않는다
-      const model = (await getModels('speech')).find((m) => m.id === modelId)
-      if (!model) return send(res, 400, { error: '사용할 수 없는 모델입니다.' })
-      let voice = null
-      if (model.voices.length > 0) {
-        voice = typeof body.voice === 'string' && body.voice ? body.voice : model.defaultVoice
-        if (!model.voices.includes(voice)) return send(res, 400, { error: '이 모델에서 쓸 수 없는 목소리입니다.' })
-      }
+      const { model, voice, error } = await resolveSpeech(modelId, body.voice)
+      if (error) return send(res, 400, { error })
 
       const { rows } = await pool.query('SELECT * FROM ideas WHERE id = $1', [String(body?.id ?? '')])
       if (!rows[0]) return send(res, 404, { error: '아이디어를 찾을 수 없습니다.' })
@@ -963,16 +1081,69 @@ async function handle(req, res) {
     }
   }
 
-  // 천안 현재 날씨. 기상청 호출 한도를 아끼려고 10분 동안 메모리에 캐시한다 (키는 응답·로그에 내보내지 않음)
+  // 출근길 브리핑. 날씨·뉴스·주가를 동시에 모아 글(텍스트 모델)과 음성(읽어 주기 모델)으로 돌려준다
+  // 셋 중 일부가 실패하면 "정보 없음"으로 쓰고, 음성이 실패해도 글은 돌려준다
+  if (path === '/api/briefing' && req.method === 'POST') {
+    if (!process.env.OPENROUTER_API_KEY?.trim()) {
+      return send(res, 503, { error: 'OPENROUTER_API_KEY가 없습니다. .env 파일을 확인해 주세요.' })
+    }
+    let body
+    try {
+      body = await readJson(req)
+    } catch {
+      return send(res, 400, { error: '요청 형식이 올바르지 않습니다.' })
+    }
+
+    // 종목은 화면의 내 종목 목록(없으면 기본 4종목). 규칙은 /api/stock과 같다
+    const rawSymbols = Array.isArray(body?.symbols) ? body.symbols : DEFAULT_SYMBOLS
+    const symbols = [...new Set(rawSymbols.map((s) => String(s).trim().toUpperCase()).filter(Boolean))]
+    if (symbols.length > MAX_SYMBOLS) return send(res, 400, { error: `종목은 ${MAX_SYMBOLS}개까지 쓸 수 있습니다.` })
+    if (!symbols.every((s) => SYMBOL_PATTERN.test(s))) return send(res, 400, { error: '종목 기호 형식이 올바르지 않습니다.' })
+    const textModel = typeof body.model === 'string' && body.model ? body.model : DEFAULT_MODEL
+    const speechModelId = typeof body.speechModel === 'string' && body.speechModel ? body.speechModel : DEFAULT_SPEECH_MODEL
+
+    try {
+      // 비용이 드는 호출 전에 모델부터 확인한다
+      if (!(await getModels('text')).some((m) => m.id === textModel)) return send(res, 400, { error: '사용할 수 없는 모델입니다.' })
+      const speech = await resolveSpeech(speechModelId, body.voice)
+      if (speech.error) return send(res, 400, { error: speech.error })
+
+      const gathered = await gatherBriefing(symbols, BRIEFING_NEWS_QUERY)
+      const sources = { weather: Boolean(gathered.weather), news: Boolean(gathered.news), stocks: Boolean(gathered.stocks) }
+      if (!Object.values(sources).some(Boolean)) return send(res, 502, { error: '브리핑할 정보를 하나도 가져오지 못했습니다.' })
+
+      const written = await writeBriefing(briefingFacts(gathered, BRIEFING_NEWS_QUERY), textModel)
+
+      let audio = null
+      let audioError = null
+      try {
+        const spoken = await speakText(written.text, speech.model, speech.voice)
+        audio = {
+          url: `data:${spoken.mime};base64,${spoken.audio.toString('base64')}`,
+          model: speech.model.id,
+          voice: speech.voice,
+          cost: spoken.cost,
+        }
+      } catch (err) {
+        if (!(err instanceof UpstreamError)) throw err
+        console.error(`브리핑 음성: ${err.message}`)
+        audioError = '음성을 만들지 못했습니다. 글만 보여 드립니다.'
+      }
+      return send(res, 200, { text: written.text, sources, model: written.model, cost: written.cost, audio, audioError })
+    } catch (err) {
+      if (!(err instanceof UpstreamError)) throw err
+      console.error(err.message)
+      return send(res, 502, { error: '브리핑을 만들지 못했습니다. 잠시 후 다시 시도해 주세요.' })
+    }
+  }
+
+  // 천안 현재 날씨 (10분 캐시, 키는 응답·로그에 내보내지 않음)
   if (path === '/api/weather' && req.method === 'GET') {
     if (!process.env.KMA_API_KEY?.trim()) {
       return send(res, 503, { error: 'KMA_API_KEY가 없습니다. .env 파일을 확인해 주세요.' })
     }
-    if (weatherCache && weatherCache.expiresAt > Date.now()) return send(res, 200, weatherCache.data)
     try {
-      const data = await fetchWeather()
-      weatherCache = { data, expiresAt: Date.now() + WEATHER_TTL }
-      return send(res, 200, data)
+      return send(res, 200, await getWeather())
     } catch (err) {
       if (!(err instanceof UpstreamError)) throw err
       console.error(err.message)
