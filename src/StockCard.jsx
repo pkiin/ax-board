@@ -7,8 +7,8 @@ const DEFAULT_SYMBOLS = ['MSFT', 'AAPL', 'NVDA', 'GOOGL']
 const MAX_SYMBOLS = 6
 const SYMBOL_PATTERN = /^[A-Z0-9.:-]{1,15}$/
 
-// 저장된 목록이 없거나 깨져 있으면 기본 종목을 쓴다
-function loadSymbols() {
+// 저장된 목록이 없거나 깨져 있으면 기본 종목을 쓴다 (오늘의 브리핑도 이 목록을 쓴다)
+export function loadSymbols() {
   try {
     const saved = JSON.parse(localStorage.getItem(STORAGE_KEY))
     if (Array.isArray(saved) && saved.every((s) => typeof s === 'string' && SYMBOL_PATTERN.test(s))) {

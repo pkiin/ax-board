@@ -74,6 +74,11 @@ export function listenAudio({ audio, format, model }) {
   return request('/api/ai/listen', { method: 'POST', body: JSON.stringify({ audio, format, model }) })
 }
 
+// 오늘의 브리핑: { text, sources, model, cost, audio: { url, model, voice, cost } | null, audioError }
+export function createBriefing({ symbols, model, speechModel, voice }) {
+  return request('/api/briefing', { method: 'POST', body: JSON.stringify({ symbols, model, speechModel, voice }) })
+}
+
 // 다듬은 결과만 받는다. 저장은 applyProposal로 따로 한다
 export function refineIdea(id, model) {
   return request('/api/ai/refine', { method: 'POST', body: JSON.stringify({ id, model }) })
