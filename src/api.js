@@ -25,6 +25,10 @@ export function deleteIdea(id) {
   return request(`/api/ideas/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 
+export function fetchWeather() {
+  return request('/api/weather')
+}
+
 // localStorage에 남아 있는 예전 아이디어를 서버로 한 번 옮긴다.
 // 같은 id는 서버에서 중복 저장하지 않으므로 중간에 실패해도 다시 시도하면 된다.
 export async function migrateLegacyIdeas() {
