@@ -4,12 +4,16 @@ import IdeaCard from './IdeaCard.jsx'
 import WeatherCard from './WeatherCard.jsx'
 import NewsCard from './NewsCard.jsx'
 import StockCard from './StockCard.jsx'
+import SettingsDialog from './SettingsDialog.jsx'
+import { loadModel, saveModel } from './aiSettings.js'
 import { createIdea, deleteIdea, fetchIdeas, migrateLegacyIdeas } from './api.js'
 
 export default function App() {
   const [ideas, setIdeas] = useState([])
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
+  const [aiModel, setAiModel] = useState(loadModel)
+  const [settingsOpen, setSettingsOpen] = useState(false)
 
   useEffect(() => {
     let ignore = false
@@ -39,6 +43,17 @@ export default function App() {
     setIdeas((prev) => [saved, ...prev])
   }
 
+  // AI 기획안을 적용하면 서버가 돌려준 카드로 바꾼다
+  function updateIdea(saved) {
+    setIdeas((prev) => prev.map((idea) => (idea.id === saved.id ? saved : idea)))
+  }
+
+  function changeModel(model) {
+    setAiModel(model)
+    saveModel(model)
+    setSettingsOpen(false)
+  }
+
   async function removeIdea(id) {
     try {
       await deleteIdea(id)
@@ -60,6 +75,15 @@ export default function App() {
 
       <main className="main">
         <header className="page-header">
+          <button
+            type="button"
+            className="settings-button"
+            onClick={() => setSettingsOpen(true)}
+            aria-label="AI 설정"
+            title={`AI 설정 (지금 모델: ${aiModel.name})`}
+          >
+            ⚙
+          </button>
           <h1>
             우리 팀 AX 보드 - A <span className="count">아이디어 {ideas.length}개</span>
           </h1>
@@ -84,12 +108,14 @@ export default function App() {
           ) : (
             <ul className="card-list">
               {ideas.map((idea) => (
-                <IdeaCard key={idea.id} idea={idea} onDelete={removeIdea} />
+                <IdeaCard key={idea.id} idea={idea} aiModel={aiModel} onDelete={removeIdea} onUpdate={updateIdea} />
               ))}
             </ul>
           )}
         </section>
       </main>
+
+      <SettingsDialog open={settingsOpen} model={aiModel} onSave={changeModel} onClose={() => setSettingsOpen(false)} />
     </div>
   )
 }
