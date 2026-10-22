@@ -76,14 +76,14 @@ FINNHUB_API_KEY=...
   - `GET /api/ai/ping`: `OPENROUTER_API_KEY`가 읽히는지만 확인 (있으면 200 `{ ok: true, keyLoaded: true }`, 없으면 503). 키 값은 돌려주지 않는다
   - `GET /api/weather`: 기상청 초단기실황(`getUltraSrtNcst`)으로 천안(nx 62, ny 110) 현재 날씨. KST 기준 40분 전이면 한 시간 전 자료를 요청하고, 10분 동안 메모리 캐시. 키 없으면 503, 기상청 오류·타임아웃(5초)은 502. 응답 `{ location, observedAt, temperature, humidity, rain1h, precipType, windSpeed, windDir }`. 초단기실황에는 하늘상태(맑음·흐림)가 없다
   - `GET /api/news?q=검색어`: 네이버 뉴스 검색(`sort=date`, `display=3`). 검색어 trim 후 필수·50자 이하(아니면 400). 응답 `[{ title, link, date }]`, 제목의 `<b>` 태그와 HTML 엔티티는 지움, `date`는 ISO. 키 없으면 503, 네이버 오류·타임아웃(5초)은 502
-  - `GET /api/stock?s=종목기호`: Finnhub 시세(기본 `AAPL`, 대문자로 바꿈, 형식이 틀리면 400). 응답 `{ price, changePct }`(Finnhub의 `c`, `dp`). 무료 한도(분당 60회) 때문에 종목별 1분 메모리 캐시. 키 없으면 503, Finnhub 오류·없는 종목·타임아웃은 502
+  - `GET /api/stock?s=MSFT,AAPL,NVDA,GOOGL`: Finnhub 시세(쉼표로 여러 종목, 없으면 이 기본 4종목). 대문자로 바꾸고 중복 제거, 1~6개·형식 검사(아니면 400). 종목마다 따로 호출해 `[{ symbol, price, changePct, found }]`(`c`, `dp`). 값이 모두 0이거나 403(무료 플랜에서 볼 수 없는 종목)이면 `found: false`. 한 종목이 실패하면 그 줄만 `{ found: null, error }`, 모두 실패하면 502. 무료 한도(분당 60회) 때문에 종목별 1분 메모리 캐시(실패는 저장 안 함). 키 없으면 503
 - `scripts/dev-all.js`: `dev:server`와 `dev`를 함께 띄우고 출력에 `[api]`/`[web]`을 붙인다
 - `vite.config.js`: 포트(`$PORT`, strictPort)와 `/api` → `$PORT + 100` 프록시
 - `src/App.jsx`: 목록 상태 소유. 처음에 서버에서 불러오고, 추가·삭제는 서버 응답 후 화면에 반영
 - 레이아웃: `.page`가 2단 grid. 왼쪽 `<aside className="side">`가 "오늘의 정보" 영역(날씨 → 뉴스 → 주가 순서, 카드는 `.widget` 공통 스타일). 카드마다 따로 불러와서 서로 기다리지 않고, 하나가 실패해도 나머지는 보인다, 오른쪽 `<main>`에 보드. 800px 이하에서는 한 줄로 쌓인다
 - `src/WeatherCard.jsx`: 날씨 카드. 로딩·에러 상태를 직접 가져 아이디어 목록과 따로 동작
 - `src/NewsCard.jsx`: 뉴스 카드. 검색어 기본값 "천안 AX", 카드 안에서 바꿔 검색. 제목은 새 탭 링크
-- `src/StockCard.jsx`: 주가 카드(AAPL). 오르면 ▲ 빨강, 내리면 ▼ 파랑
+- `src/StockCard.jsx`: 주가 카드. 종목마다 한 줄(기호·현재가·▲▼ 등락률·삭제), 아래 입력란으로 추가(추가 전 조회해서 없는 종목이면 "찾을 수 없는 종목이에요"). 목록은 `localStorage`(`ax-board.stocks.v1`)에 저장, 기본 MSFT·AAPL·NVDA·GOOGL, 최대 6종목
 - `src/api.js`: 백엔드 호출, 예전 `localStorage`(`ax-board.ideas.v1`) 데이터를 첫 접속 때 서버로 이전 후 삭제
 - `src/IdeaForm.jsx`: 입력 폼, 세 필드(제목·대상 업무·아이디어) trim 후 필수값 검증. 저장 실패 시 입력 내용 유지
 - `src/IdeaCard.jsx`: 카드 표시와 삭제 버튼(삭제 전 확인창)

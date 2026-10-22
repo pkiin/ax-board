@@ -33,8 +33,8 @@ export function fetchNews(query) {
   return request(`/api/news?${new URLSearchParams({ q: query })}`)
 }
 
-export function fetchStock(symbol) {
-  return request(`/api/stock?${new URLSearchParams({ s: symbol })}`)
+export function fetchStocks(symbols) {
+  return request(`/api/stock?${new URLSearchParams({ s: symbols.join(',') })}`)
 }
 
 // localStorage에 남아 있는 예전 아이디어를 서버로 한 번 옮긴다.
