@@ -44,12 +44,38 @@ async function initSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
   `)
+  // 활용 장면 영상 (카드당 한 개). 만드는 데 몇 분 걸려 작업 상태를 저장하고 서버가 백그라운드에서 확인한다
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS idea_videos (
+      idea_id     TEXT PRIMARY KEY REFERENCES ideas(id) ON DELETE CASCADE,
+      status      TEXT NOT NULL,
+      job_id      TEXT NOT NULL,
+      polling_url TEXT NOT NULL,
+      model       TEXT NOT NULL,
+      prompt      TEXT NOT NULL,
+      scenario    JSONB,
+      duration    INTEGER NOT NULL,
+      audio       BOOLEAN NOT NULL,
+      estimate    NUMERIC,
+      cost        NUMERIC,
+      mime        TEXT,
+      data        BYTEA,
+      error       TEXT,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      finished_at TIMESTAMPTZ
+    )
+  `)
 }
 
-// 아이디어와 대표 이미지 정보(파일 제외)를 함께 읽는다
+// 아이디어와 대표 이미지·영상 정보(파일 제외)를 함께 읽는다
 const IDEA_SELECT = `
-  SELECT i.*, im.kind AS image_kind, im.caption AS image_caption, im.created_at AS image_at
-  FROM ideas i LEFT JOIN idea_images im ON im.idea_id = i.id`
+  SELECT i.*, im.kind AS image_kind, im.caption AS image_caption, im.created_at AS image_at,
+    iv.status AS video_status, iv.model AS video_model, iv.duration AS video_duration, iv.audio AS video_audio,
+    iv.scenario AS video_scenario, iv.estimate AS video_estimate, iv.cost AS video_cost, iv.error AS video_error,
+    iv.created_at AS video_created_at, iv.finished_at AS video_finished_at
+  FROM ideas i
+  LEFT JOIN idea_images im ON im.idea_id = i.id
+  LEFT JOIN idea_videos iv ON iv.idea_id = i.id`
 
 async function findIdea(id) {
   const { rows } = await pool.query(`${IDEA_SELECT} WHERE i.id = $1`, [id])
@@ -70,6 +96,24 @@ function toIdea(row) {
           kind: row.image_kind,
           caption: row.image_caption ?? null,
           url: `/api/ideas/${encodeURIComponent(row.id)}/image?v=${row.image_at.getTime()}`,
+        }
+      : null,
+    // status: generating(만드는 중) · ready(재생 가능, url) · failed(error)
+    video: row.video_status
+      ? {
+          status: row.video_status,
+          model: row.video_model,
+          duration: row.video_duration,
+          audio: row.video_audio,
+          scenario: row.video_scenario ?? null,
+          estimate: row.video_estimate === null ? null : Number(row.video_estimate),
+          cost: row.video_cost === null ? null : Number(row.video_cost),
+          error: row.video_error ?? null,
+          createdAt: row.video_created_at.toISOString(),
+          url:
+            row.video_status === 'ready'
+              ? `/api/ideas/${encodeURIComponent(row.id)}/video?v=${row.video_finished_at.getTime()}`
+              : null,
         }
       : null,
   }
@@ -284,7 +328,7 @@ async function getQuote(symbol) {
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1'
 const DEFAULT_MODEL = 'openrouter/free'
 const MODELS_TTL = 60 * 60 * 1000
-const MODEL_KINDS = ['text', 'vision', 'image', 'speech', 'transcription']
+const MODEL_KINDS = ['text', 'vision', 'image', 'speech', 'transcription', 'video']
 const PROPOSAL_FIELDS = {
   title: { label: '제목', max: 80 },
   summary: { label: '한 줄 요약', max: 200 },
@@ -320,6 +364,7 @@ const RANKING_URLS = {
   image: 'https://openrouter.ai/rankings/image',
   speech: 'https://openrouter.ai/rankings/speech',
   transcription: 'https://openrouter.ai/rankings/transcription',
+  video: 'https://openrouter.ai/rankings/video',
 }
 const RANKING_RETRY = 10 * 60 * 1000
 
@@ -341,10 +386,10 @@ function validateProposal(input) {
   return { value }
 }
 
-async function fetchModelList(query) {
+async function fetchModelList(path) {
   let body
   try {
-    const res = await fetch(`${OPENROUTER_URL}/models${query}`, { signal: AbortSignal.timeout(10000) })
+    const res = await fetch(`${OPENROUTER_URL}${path}`, { signal: AbortSignal.timeout(10000) })
     body = await res.json()
     if (!res.ok || !Array.isArray(body?.data)) throw new Error(`HTTP ${res.status}`)
   } catch (err) {
@@ -356,7 +401,7 @@ async function fetchModelList(query) {
 // 기본 목록에는 이미지만 내는 모델(flux 등)·음성 모델이 빠져 있어 모든 출력 종류를 받는다
 async function getCatalog() {
   if (catalogCache && catalogCache.expiresAt > Date.now()) return catalogCache.data
-  const data = await fetchModelList('?output_modalities=all')
+  const data = await fetchModelList('/models?output_modalities=all')
   catalogCache = { data, expiresAt: Date.now() + MODELS_TTL }
   return data
 }
@@ -397,6 +442,7 @@ async function getRanking(kind) {
 // 가격은 토큰당 USD 문자열로 온다. 화면에서 읽기 쉽게 100만 토큰당 USD로 바꾼다
 // kind: text(다듬기) · vision(사진 설명, 이미지 입력 → 글) · image(이미지 그리기, 이미지 출력)
 async function getModels(kind = 'text') {
+  if (kind === 'video') return getVideoModels()
   if (kind !== 'text') return getMediaModels(kind)
   const catalog = await getCatalog()
   return catalog
@@ -818,6 +864,254 @@ async function transcribeAudio(data, format, model) {
   return { text, model, seconds: Number(body.usage?.seconds) || null, cost: Number(body.usage?.cost) || 0 }
 }
 
+// 활용 장면 영상. 기본 모델은 프런트(src/aiSettings.js)와 같게 둔다
+const DEFAULT_VIDEO_MODEL = 'google/veo-3.1-lite'
+const VIDEO_MIN_SECONDS = 5
+const VIDEO_MAX_SECONDS = 8
+const VIDEO_ASPECT_RATIO = '16:9'
+// 영상 토큰 가격 모델(Seedance 등)의 토큰 수: 가로 × 세로 × 24fps × 초 / 1024
+const VIDEO_FPS = 24
+const VIDEO_SIZES = { '480p': [854, 480], '720p': [1280, 720], '768p': [1366, 768], '1080p': [1920, 1080], '2K': [2560, 1440], '4K': [3840, 2160] }
+const VIDEO_POLL_INTERVAL = 20 * 1000
+const VIDEO_TIMEOUT = 20 * 60 * 1000 // 이보다 오래 걸리면 실패로 둔다
+const MAX_SCENE = 300
+const MAX_VIDEO_PROMPT = 2000
+
+let videoModelsCache = null // { data, expiresAt } /videos/models 원본
+
+// 가격 키 이름이 모델마다 다르다(USD/초 duration_seconds_*, 센트/초 cents_*, 영상 토큰 video_tokens_*).
+// 고른 해상도·소리 여부에 가장 맞는 키를 골라 초당 USD로 바꾼다. 맞는 키가 없으면 null
+function videoSecondPrice(skus, resolution, audio) {
+  const resolutions = Object.keys(VIDEO_SIZES).map((r) => r.toLowerCase())
+  let best = null
+  for (const [key, raw] of Object.entries(skus ?? {})) {
+    const value = Number(raw)
+    const k = key.toLowerCase()
+    if (!Number.isFinite(value)) continue
+    // 첫 장면 이미지로 만드는 경우만 본다 (참조·이어 만들기·업스케일·영상 입력·글로만 만들기 가격 제외)
+    if (/reference|continuation|megapixel|minimum|input|text_to_video/.test(k)) continue
+    const keyResolution = resolutions.find((r) => k.endsWith(`_${r}`) || k.includes(`_${r}_`))
+    if (keyResolution && keyResolution !== resolution.toLowerCase()) continue
+
+    let perSecond
+    if (k.includes('video_tokens')) {
+      const [w, h] = VIDEO_SIZES[resolution] ?? VIDEO_SIZES['720p']
+      perSecond = ((w * h * VIDEO_FPS) / 1024) * value
+    } else if (k.startsWith('cents_')) {
+      if (!k.includes('second')) continue
+      perSecond = value / 100
+    } else if (k.includes('duration_seconds')) {
+      perSecond = value
+    } else {
+      continue
+    }
+
+    // 점수가 낮을수록 잘 맞는다: 해상도가 정확히 맞으면 우선, 소리 여부가 맞으면 우선, image_to_video 우선
+    const withAudio = k.includes('with_audio')
+    const withoutAudio = k.includes('without_audio')
+    let score = keyResolution ? 0 : 1
+    if (audio) score += withoutAudio ? 10 : withAudio ? 0 : 1
+    else score += withAudio ? 10 : withoutAudio ? 0 : 1
+    if (!k.includes('image_to_video')) score += 0.5
+    if (!best || score < best.score) best = { score, perSecond }
+  }
+  return best && best.score < 10 ? best.perSecond : null
+}
+
+// 영상 모델: 첫 장면 이미지를 받고 5~8초 길이를 지원하는 모델만. 가격은 720p(없으면 지원하는 첫 해상도) 기준
+async function getVideoModels() {
+  let raw
+  if (videoModelsCache && videoModelsCache.expiresAt > Date.now()) {
+    raw = videoModelsCache.data
+  } else {
+    raw = await fetchModelList('/videos/models')
+    videoModelsCache = { data: raw, expiresAt: Date.now() + MODELS_TTL }
+  }
+  const ranking = await getRanking('video')
+  const data = raw
+    .filter((m) => m.supported_frame_images?.includes('first_frame'))
+    .map((m) => {
+      const durations = (m.supported_durations ?? [])
+        .filter((d) => d >= VIDEO_MIN_SECONDS && d <= VIDEO_MAX_SECONDS)
+        .sort((a, b) => a - b)
+      const resolutions = m.supported_resolutions ?? []
+      const resolution = resolutions.includes('720p') ? '720p' : (resolutions[0] ?? '720p')
+      const audio = m.generate_audio === true
+      const silent = videoSecondPrice(m.pricing_skus, resolution, false)
+      const withAudio = audio ? videoSecondPrice(m.pricing_skus, resolution, true) : null
+      const duration = durations.at(-1)
+      const perSecond = withAudio ?? silent
+      return {
+        id: m.id,
+        name: m.name,
+        free: false,
+        durations,
+        resolution,
+        audio,
+        // 초당 USD. 소리를 만들 수 없는 모델은 audio가 null
+        pricePerSecond: { audio: withAudio, silent },
+        // 가장 긴 길이, 소리 포함(가능하면) 기준 1회 예상 비용
+        estimate: perSecond === null ? null : perSecond * duration,
+        default: m.id === DEFAULT_VIDEO_MODEL,
+        usage: ranking.get(`${m.canonical_slug}|standard`) ?? 0,
+      }
+    })
+    // 길이가 맞지 않거나 가격을 계산할 수 없는 모델은 비용을 미리 알 수 없어 뺀다
+    .filter((m) => m.durations.length > 0 && m.estimate !== null)
+
+  const cheapest = data.slice().sort((a, b) => a.estimate - b.estimate || b.default - a.default)[0]
+  const popular = data.filter((m) => m.usage > 0).sort((a, b) => b.usage - a.usage)[0]
+  const rank = (m) => (m.default ? 0 : m.popular ? 1 : m.cheapest ? 2 : 4)
+  return data
+    .map(({ usage, ...rest }) => ({ ...rest, cheapest: rest.id === cheapest?.id, popular: rest.id === popular?.id }))
+    .sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name))
+}
+
+function videoCost(model, duration, audio) {
+  const perSecond = audio ? model.pricePerSecond.audio : model.pricePerSecond.silent
+  return (perSecond ?? model.pricePerSecond.silent ?? model.pricePerSecond.audio) * duration
+}
+
+const VIDEO_PLAN_PROMPT = `너는 사내 AI 활용(AX) 아이디어를 짧은 영상으로 보여 주는 영상 기획자다.
+카드의 "대상 업무"를 AI 도입 전 장면으로, "AI 활용 아이디어"를 도입 후 장면으로 해서 한 편의 짧은 영상을 기획한다.
+영상의 첫 장면은 카드 대표 이미지로 정해져 있다. 아래 키를 가진 JSON 객체 하나만 출력한다. 설명, 코드 블록 표시는 쓰지 않는다.
+- before: 도입 전 장면 설명 (한국어, 2문장 이내)
+- after: 도입 후 장면 설명 (한국어, 2문장 이내)
+- duration: 영상 길이(초). 사용자가 준 선택지 중 하나
+- prompt: 영상 생성 모델에 넣을 영어 프롬프트. 첫 장면 이미지에서 시작해 도입 전 → 도입 후로 자연스럽게 바뀌는 한 장면 흐름, 카메라 움직임, 분위기를 구체적으로 쓴다. 화면에 글자·자막·로고는 넣지 않는다. 600자 이내
+원래 아이디어에 없는 사실을 단정하지 않는다.`
+
+function validateScenario(input, durations) {
+  if (typeof input !== 'object' || input === null) return { error: '시나리오 형식이 올바르지 않습니다.' }
+  const text = (key) => (typeof input[key] === 'string' ? input[key].trim() : '')
+  const before = text('before')
+  const after = text('after')
+  const prompt = text('prompt')
+  if (!before || !after) return { error: '도입 전·후 장면이 비어 있습니다.' }
+  if (before.length > MAX_SCENE || after.length > MAX_SCENE) return { error: `장면 설명은 ${MAX_SCENE}자 이하여야 합니다.` }
+  if (!prompt) return { error: '영상 프롬프트가 비어 있습니다.' }
+  if (prompt.length > MAX_VIDEO_PROMPT) return { error: `영상 프롬프트는 ${MAX_VIDEO_PROMPT}자 이하여야 합니다.` }
+  const duration = Number(input.duration)
+  if (!durations.includes(duration)) return { error: `영상 길이는 ${durations.join('·')}초 중 하나여야 합니다.` }
+  return { value: { before, after, prompt, duration } }
+}
+
+// 시나리오는 글 모델로 만든다 (형식이 틀리면 한 번 더). 길이가 선택지에 없으면 가장 긴 길이로 맞춘다
+async function planVideo(idea, textModel, videoModel) {
+  const title = idea.proposal?.title ?? idea.title
+  const messages = [
+    { role: 'system', content: VIDEO_PLAN_PROMPT },
+    {
+      role: 'user',
+      content: `제목: ${title}\n대상 업무: ${idea.target}\nAI 활용 아이디어: ${idea.proposal?.approach ?? idea.idea}\n영상 길이 선택지(초): ${videoModel.durations.join(', ')}`,
+    },
+  ]
+  let lastError = ''
+  let cost = 0
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const body = await callOpenRouter({ model: textModel, messages }, 60000)
+    cost += Number(body.usage?.cost) || 0
+    const content = body.choices?.[0]?.message?.content
+    const raw = typeof content === 'string' ? content : ''
+    const start = raw.indexOf('{')
+    const end = raw.lastIndexOf('}')
+    let parsed = null
+    try {
+      parsed = start >= 0 && end > start ? JSON.parse(raw.slice(start, end + 1)) : null
+    } catch {
+      // 아래에서 다시 시도
+    }
+    if (parsed && !videoModel.durations.includes(Number(parsed.duration))) parsed.duration = videoModel.durations.at(-1)
+    const { value, error } = parsed ? validateScenario(parsed, videoModel.durations) : { error: '시나리오를 JSON으로 받지 못했습니다.' }
+    if (value) return { scenario: value, textModel: body.model ?? textModel, cost }
+    lastError = `${error} (${body.model ?? textModel})`
+  }
+  throw new UpstreamError(lastError)
+}
+
+// 영상 작업 제출. 첫 장면은 화면이 16:9로 맞춰 보낸 대표 이미지(data URL)
+async function submitVideo({ model, prompt, duration, audio, firstFrame }) {
+  const body = await callOpenRouterPath(
+    '/videos',
+    {
+      model: model.id,
+      prompt,
+      duration,
+      resolution: model.resolution,
+      aspect_ratio: VIDEO_ASPECT_RATIO,
+      ...(model.audio && { generate_audio: audio }),
+      frame_images: [{ type: 'image_url', image_url: { url: firstFrame }, frame_type: 'first_frame' }],
+    },
+    60000,
+  )
+  if (!body.id || !body.polling_url) throw new UpstreamError('영상 작업 정보를 받지 못했습니다.')
+  return body
+}
+
+function openRouterAuth() {
+  return { Authorization: `Bearer ${process.env.OPENROUTER_API_KEY.trim()}` }
+}
+
+// 만드는 중인 영상을 확인한다. 끝나면 mp4를 받아 DB에 저장하고, 실패·시간 초과는 에러를 남긴다
+let videoPolling = false
+async function pollVideos() {
+  if (videoPolling || !process.env.OPENROUTER_API_KEY?.trim()) return
+  videoPolling = true
+  try {
+    const { rows } = await pool.query("SELECT idea_id, job_id, polling_url, created_at FROM idea_videos WHERE status = 'generating'")
+    for (const row of rows) {
+      try {
+        await pollVideo(row)
+      } catch (err) {
+        // 네트워크 오류 등은 다음 확인 때 다시 시도한다
+        console.error(`영상 상태를 확인하지 못했습니다. (${row.job_id}, ${err.message})`)
+      }
+    }
+  } catch (err) {
+    console.error('영상 작업 목록을 읽지 못했습니다:', err.message)
+  } finally {
+    videoPolling = false
+  }
+}
+
+async function failVideo(row, error) {
+  await pool.query("UPDATE idea_videos SET status = 'failed', error = $3, finished_at = now() WHERE idea_id = $1 AND job_id = $2", [
+    row.idea_id,
+    row.job_id,
+    error,
+  ])
+}
+
+async function pollVideo(row) {
+  if (Date.now() - row.created_at.getTime() > VIDEO_TIMEOUT) return failVideo(row, '시간이 너무 오래 걸려 멈췄습니다.')
+  const res = await fetch(new URL(row.polling_url, 'https://openrouter.ai'), {
+    headers: openRouterAuth(),
+    signal: AbortSignal.timeout(15000),
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const job = await res.json()
+  if (job.status === 'failed' || job.status === 'cancelled' || job.status === 'expired') {
+    console.error(`영상 생성 실패 (${row.job_id}): ${job.error ?? job.status}`)
+    return failVideo(row, `영상을 만들지 못했습니다. (${job.error ?? job.status})`)
+  }
+  if (job.status !== 'completed') return
+
+  const videoUrl = job.unsigned_urls?.[0] ?? `${OPENROUTER_URL}/videos/${job.id}/content?index=0`
+  const video = await fetch(videoUrl, {
+    headers: videoUrl.startsWith('https://openrouter.ai/api/') ? openRouterAuth() : undefined,
+    signal: AbortSignal.timeout(60000),
+  })
+  if (!video.ok) throw new Error(`영상 내려받기 HTTP ${video.status}`)
+  const data = Buffer.from(await video.arrayBuffer())
+  const mime = video.headers.get('content-type')?.split(';')[0] || 'video/mp4'
+  await pool.query(
+    `UPDATE idea_videos SET status = 'ready', data = $3, mime = $4, cost = $5, finished_at = now()
+     WHERE idea_id = $1 AND job_id = $2`,
+    [row.idea_id, row.job_id, data, mime, Number(job.usage?.cost) || null],
+  )
+  console.log(`영상 완료 (${row.job_id}, ${data.length} bytes, $${job.usage?.cost ?? '?'})`)
+}
+
 async function handle(req, res) {
   const url = new URL(req.url, 'http://localhost')
   const path = url.pathname
@@ -849,6 +1143,11 @@ async function handle(req, res) {
   }
 
   const match = path.match(/^\/api\/ideas\/([^/]+)$/)
+  // 카드 하나 (영상을 만드는 동안 화면이 상태를 다시 읽는다)
+  if (match && req.method === 'GET') {
+    const idea = await findIdea(decodeURIComponent(match[1]))
+    return idea ? send(res, 200, idea) : send(res, 404, { error: '아이디어를 찾을 수 없습니다.' })
+  }
   if (match && req.method === 'DELETE') {
     const id = decodeURIComponent(match[1])
     const { rowCount } = await pool.query('DELETE FROM ideas WHERE id = $1', [id])
@@ -919,6 +1218,98 @@ async function handle(req, res) {
   if (imageMatch && req.method === 'DELETE') {
     const id = decodeURIComponent(imageMatch[1])
     await pool.query('DELETE FROM idea_images WHERE idea_id = $1', [id])
+    const idea = await findIdea(id)
+    return idea ? send(res, 200, idea) : send(res, 404, { error: '아이디어를 찾을 수 없습니다.' })
+  }
+
+  // 활용 장면 영상: 파일 보기(GET, 탐색용 Range 지원) · 만들기(POST) · 지우기(DELETE)
+  const videoMatch = path.match(/^\/api\/ideas\/([^/]+)\/video$/)
+  if (videoMatch && req.method === 'GET') {
+    const { rows } = await pool.query("SELECT mime, data FROM idea_videos WHERE idea_id = $1 AND status = 'ready'", [
+      decodeURIComponent(videoMatch[1]),
+    ])
+    if (!rows[0]) return send(res, 404, { error: '영상이 없습니다.' })
+    const { mime, data } = rows[0]
+    const headers = { 'Content-Type': mime, 'Accept-Ranges': 'bytes', 'Cache-Control': 'private, max-age=31536000, immutable' }
+    const range = req.headers.range?.match(/^bytes=(\d*)-(\d*)$/)
+    if (range && (range[1] || range[2])) {
+      // bytes=시작-끝, bytes=시작-, bytes=-끝에서부터
+      let start = range[1] ? Number(range[1]) : data.length - Number(range[2])
+      let end = range[1] && range[2] ? Number(range[2]) : data.length - 1
+      start = Math.max(0, start)
+      end = Math.min(end, data.length - 1)
+      if (start > end) {
+        res.writeHead(416, { 'Content-Range': `bytes */${data.length}` })
+        return res.end()
+      }
+      res.writeHead(206, { ...headers, 'Content-Range': `bytes ${start}-${end}/${data.length}`, 'Content-Length': end - start + 1 })
+      return res.end(data.subarray(start, end + 1))
+    }
+    res.writeHead(200, { ...headers, 'Content-Length': data.length })
+    return res.end(data)
+  }
+
+  // 시나리오 패널에서 "만들기"를 눌렀을 때만 온다. 작업만 제출하고 바로 돌려준다 (완료는 pollVideos가 확인)
+  if (videoMatch && req.method === 'POST') {
+    if (!process.env.OPENROUTER_API_KEY?.trim()) {
+      return send(res, 503, { error: 'OPENROUTER_API_KEY가 없습니다. .env 파일을 확인해 주세요.' })
+    }
+    let body
+    try {
+      body = await readJson(req, IMAGE_BODY_LIMIT)
+    } catch {
+      return send(res, 400, { error: '요청 형식이 올바르지 않거나 첫 장면 이미지가 너무 큽니다.' })
+    }
+    const id = decodeURIComponent(videoMatch[1])
+    const modelId = typeof body?.model === 'string' && body.model ? body.model : DEFAULT_VIDEO_MODEL
+    const { error: frameError } = parseDataUrl(body?.firstFrame)
+    if (frameError) return send(res, 400, { error: `첫 장면 이미지: ${frameError}` })
+
+    try {
+      const model = (await getVideoModels()).find((m) => m.id === modelId)
+      if (!model) return send(res, 400, { error: '사용할 수 없는 모델입니다.' })
+      const { value: scenario, error } = validateScenario(body, model.durations)
+      if (error) return send(res, 400, { error })
+      const audio = model.audio && body.audio !== false
+
+      const idea = await findIdea(id)
+      if (!idea) return send(res, 404, { error: '아이디어를 찾을 수 없습니다.' })
+      if (!idea.image) return send(res, 400, { error: '먼저 사진을 올리거나 이미지를 그려 주세요. 영상의 첫 장면으로 씁니다.' })
+      if (idea.video?.status === 'generating') return send(res, 409, { error: '이미 영상을 만드는 중입니다.' })
+
+      const job = await submitVideo({ model, prompt: scenario.prompt, duration: scenario.duration, audio, firstFrame: body.firstFrame })
+      await pool.query(
+        `INSERT INTO idea_videos (idea_id, status, job_id, polling_url, model, prompt, scenario, duration, audio, estimate)
+         VALUES ($1, 'generating', $2, $3, $4, $5, $6, $7, $8, $9)
+         ON CONFLICT (idea_id) DO UPDATE SET
+           status = 'generating', job_id = EXCLUDED.job_id, polling_url = EXCLUDED.polling_url, model = EXCLUDED.model,
+           prompt = EXCLUDED.prompt, scenario = EXCLUDED.scenario, duration = EXCLUDED.duration, audio = EXCLUDED.audio,
+           estimate = EXCLUDED.estimate, cost = NULL, mime = NULL, data = NULL, error = NULL, created_at = now(), finished_at = NULL`,
+        [
+          id,
+          job.id,
+          job.polling_url,
+          model.id,
+          scenario.prompt,
+          { before: scenario.before, after: scenario.after, prompt: scenario.prompt },
+          scenario.duration,
+          audio,
+          videoCost(model, scenario.duration, audio),
+        ],
+      )
+      console.log(`영상 작업 제출 (${job.id}, ${model.id}, ${scenario.duration}초)`)
+      return send(res, 202, await findIdea(id))
+    } catch (err) {
+      if (!(err instanceof UpstreamError)) throw err
+      console.error(err.message)
+      return send(res, 502, { error: `영상 작업을 시작하지 못했습니다. ${err.message}` })
+    }
+  }
+
+  // 만드는 중에 지워도 OpenRouter 작업은 멈추지 않아 비용은 그대로 든다 (화면에서 안내)
+  if (videoMatch && req.method === 'DELETE') {
+    const id = decodeURIComponent(videoMatch[1])
+    await pool.query('DELETE FROM idea_videos WHERE idea_id = $1', [id])
     const idea = await findIdea(id)
     return idea ? send(res, 200, idea) : send(res, 404, { error: '아이디어를 찾을 수 없습니다.' })
   }
@@ -1081,6 +1472,39 @@ async function handle(req, res) {
     }
   }
 
+  // 활용 장면 영상 시나리오. 글 모델이 도입 전·후 장면과 영상 프롬프트를 쓰고, 예상 금액을 함께 준다 (영상은 만들지 않음)
+  if (path === '/api/ai/video/plan' && req.method === 'POST') {
+    if (!process.env.OPENROUTER_API_KEY?.trim()) {
+      return send(res, 503, { error: 'OPENROUTER_API_KEY가 없습니다. .env 파일을 확인해 주세요.' })
+    }
+    let body
+    try {
+      body = await readJson(req)
+    } catch {
+      return send(res, 400, { error: '요청 형식이 올바르지 않습니다.' })
+    }
+    const modelId = typeof body?.model === 'string' && body.model ? body.model : DEFAULT_VIDEO_MODEL
+    const textModelId = typeof body?.textModel === 'string' && body.textModel ? body.textModel : DEFAULT_MODEL
+
+    try {
+      const [videoModels, textModels] = await Promise.all([getVideoModels(), getModels('text')])
+      const model = videoModels.find((m) => m.id === modelId)
+      if (!model) return send(res, 400, { error: '사용할 수 없는 영상 모델입니다.' })
+      if (!textModels.some((m) => m.id === textModelId)) return send(res, 400, { error: '사용할 수 없는 글 모델입니다.' })
+
+      const idea = await findIdea(String(body?.id ?? ''))
+      if (!idea) return send(res, 404, { error: '아이디어를 찾을 수 없습니다.' })
+      if (!idea.image) return send(res, 400, { error: '먼저 사진을 올리거나 이미지를 그려 주세요. 영상의 첫 장면으로 씁니다.' })
+
+      const { scenario, textModel, cost } = await planVideo(idea, textModelId, model)
+      return send(res, 200, { scenario, model, textModel, cost })
+    } catch (err) {
+      if (!(err instanceof UpstreamError)) throw err
+      console.error(err.message)
+      return send(res, 502, { error: '시나리오를 만들지 못했습니다. 잠시 후 다시 시도해 주세요.' })
+    }
+  }
+
   // 출근길 브리핑. 날씨·뉴스·주가를 동시에 모아 글(텍스트 모델)과 음성(읽어 주기 모델)으로 돌려준다
   // 셋 중 일부가 실패하면 "정보 없음"으로 쓰고, 음성이 실패해도 글은 돌려준다
   if (path === '/api/briefing' && req.method === 'POST') {
@@ -1213,4 +1637,7 @@ server.on('error', (err) => {
 
 server.listen(API_PORT, () => {
   console.log(`API 서버: http://localhost:${API_PORT}`)
+  // 만드는 중인 영상을 주기적으로 확인한다 (서버를 다시 켜도 DB에 남은 작업부터 이어서 확인)
+  pollVideos()
+  setInterval(pollVideos, VIDEO_POLL_INTERVAL)
 })

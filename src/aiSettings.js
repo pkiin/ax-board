@@ -42,10 +42,10 @@ export function formatUsd(value) {
   return `$${value < 0.01 ? value.toFixed(4) : value.toFixed(2)}`
 }
 
-// 사진 설명(vision)·이미지 그리기(image)·읽어 주기(speech)·받아쓰기(transcription) 모델
+// 사진 설명(vision)·이미지 그리기(image)·읽어 주기(speech)·받아쓰기(transcription)·영상(video) 모델
 // 1회 예상 비용(estimate, USD)은 서버가 계산해 준다. 읽어 주기는 고른 목소리(voice)도 함께 둔다
 const MEDIA_STORAGE_KEY = 'ax-board.ai-media-models.v1'
-export const MEDIA_KINDS = ['vision', 'image', 'speech', 'transcription']
+export const MEDIA_KINDS = ['vision', 'image', 'speech', 'transcription', 'video']
 
 export const DEFAULT_MEDIA_MODELS = {
   vision: {
@@ -77,6 +77,17 @@ export const DEFAULT_MEDIA_MODELS = {
     outputPrice: 0,
     secondPrice: 0.00000333,
   },
+  // 영상 가격은 초당 USD (소리 포함/없음), 길이는 모델이 지원하는 5~8초
+  video: {
+    id: 'google/veo-3.1-lite',
+    name: 'Google: Veo 3.1 Lite',
+    free: false,
+    estimate: 0.4,
+    resolution: '720p',
+    durations: [6, 8],
+    audio: true,
+    pricePerSecond: { audio: 0.05, silent: 0.03 },
+  },
 }
 
 export function loadMediaModels() {
@@ -105,9 +116,20 @@ function formatRate(value) {
   return `$${Number(value.toFixed(digits))}`
 }
 
-// 읽어 주기는 100만 글자당, 받아쓰기는 초당 가격. 그 밖에는 1회(1장) 예상 비용
+// 영상 1회 비용: 소리를 만들 수 없는 모델은 소리 없는 가격
+export function videoCost(model, duration, audio) {
+  const { audio: withAudio, silent } = model.pricePerSecond
+  return ((audio ? withAudio : silent) ?? silent ?? withAudio) * duration
+}
+
+// 읽어 주기는 100만 글자당, 받아쓰기·영상은 초당 가격. 그 밖에는 1회(1장) 예상 비용
 export function formatMediaPrice(model, kind) {
   if (model.free) return '무료'
+  if (kind === 'video') {
+    const audio = model.pricePerSecond.audio !== null
+    const longest = model.durations.at(-1)
+    return `${model.resolution}${audio ? '·소리' : ''} 초당 ${formatRate(videoCost(model, 1, audio))} · ${longest}초 약 ${formatUsd(model.estimate)}`
+  }
   if (kind === 'speech') {
     const audio = model.outputPrice > 0 ? ` + 오디오 출력 ${formatRate(model.outputPrice)}/100만 토큰` : ''
     return `100만 글자당 ${formatRate(model.inputPrice)}${audio}`

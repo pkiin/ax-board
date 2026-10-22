@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import IdeaForm from './IdeaForm.jsx'
 import IdeaCard from './IdeaCard.jsx'
 import WeatherCard from './WeatherCard.jsx'
@@ -45,10 +45,11 @@ export default function App() {
     setIdeas((prev) => [saved, ...prev])
   }
 
-  // AI 기획안을 적용하면 서버가 돌려준 카드로 바꾼다
-  function updateIdea(saved) {
+  // AI 기획안·이미지·영상이 바뀌면 서버가 돌려준 카드로 바꾼다
+  // 영상을 만드는 동안 카드가 주기적으로 부르므로 렌더링마다 새로 만들지 않는다
+  const updateIdea = useCallback((saved) => {
     setIdeas((prev) => prev.map((idea) => (idea.id === saved.id ? saved : idea)))
-  }
+  }, [])
 
   function changeModels({ text, ...media }) {
     setAiModel(text)

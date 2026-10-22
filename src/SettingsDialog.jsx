@@ -13,10 +13,11 @@ function toSaved(kind, m) {
   }
   const saved = { id: m.id, name: m.name, free: m.free, estimate: m.estimate, inputPrice: m.inputPrice, outputPrice: m.outputPrice }
   if (kind === 'transcription') saved.secondPrice = m.secondPrice
+  if (kind === 'video') Object.assign(saved, { resolution: m.resolution, durations: m.durations, audio: m.audio, pricePerSecond: m.pricePerSecond })
   return saved
 }
 
-// 톱니바퀴 설정 팝업: 다듬기(글)·사진 설명·이미지 그리기·읽어 주기·받아쓰기에 쓸 모델을 가격과 함께 고른다
+// 톱니바퀴 설정 팝업: 다듬기(글)·사진 설명·이미지 그리기·읽어 주기·받아쓰기·영상에 쓸 모델을 가격과 함께 고른다
 export default function SettingsDialog({ open, model, mediaModels, onSave, onClose }) {
   const dialogRef = useRef(null)
   const current = { text: model, ...mediaModels }
@@ -170,6 +171,21 @@ export default function SettingsDialog({ open, model, mediaModels, onSave, onClo
           <p className="settings-hint">새 아이디어 입력란의 "받아쓰기"에 씁니다. 가격은 녹음 초당이고, 1회는 30초 기준 예상 비용이에요.</p>
           {picker('transcription', '받아쓰기', (m) => formatMediaPrice(m, 'transcription'))}
           {paidWarning('transcription', '받아쓸 때마다')}
+        </section>
+
+        <section className="settings-section">
+          <h3>영상</h3>
+          <p className="settings-hint">
+            카드의 "활용 장면 영상"에 씁니다. 대표 이미지를 첫 장면으로 받고 5~8초를 만들 수 있는 모델만 보여요. 가격은 초당이고, 1회는 가장 긴
+            길이·소리 포함(가능하면) 기준이에요. 720p가 없는 모델은 지원하는 해상도 기준입니다.
+          </p>
+          {picker('video', '영상', (m) => formatMediaPrice(m, 'video'))}
+          {selected.video && (
+            <p className="paid-warning" role="alert">
+              유료 모델입니다. 영상을 만들 때마다 OpenRouter 크레딧에서 비용이 빠져나갑니다 (1회 약 {formatUsd(selected.video.estimate)}). 시나리오를
+              확인하고 "만들기"를 누를 때만 비용이 듭니다.
+            </p>
+          )}
         </section>
       </div>
 
