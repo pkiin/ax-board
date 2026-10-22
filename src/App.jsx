@@ -5,7 +5,7 @@ import WeatherCard from './WeatherCard.jsx'
 import NewsCard from './NewsCard.jsx'
 import StockCard from './StockCard.jsx'
 import SettingsDialog from './SettingsDialog.jsx'
-import { loadModel, saveModel } from './aiSettings.js'
+import { loadMediaModels, loadModel, saveMediaModels, saveModel } from './aiSettings.js'
 import { createIdea, deleteIdea, fetchIdeas, migrateLegacyIdeas } from './api.js'
 
 export default function App() {
@@ -13,6 +13,7 @@ export default function App() {
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [aiModel, setAiModel] = useState(loadModel)
+  const [mediaModels, setMediaModels] = useState(loadMediaModels) // { vision, image, speech, transcription }
   const [settingsOpen, setSettingsOpen] = useState(false)
 
   useEffect(() => {
@@ -48,9 +49,11 @@ export default function App() {
     setIdeas((prev) => prev.map((idea) => (idea.id === saved.id ? saved : idea)))
   }
 
-  function changeModel(model) {
-    setAiModel(model)
-    saveModel(model)
+  function changeModels({ text, ...media }) {
+    setAiModel(text)
+    saveModel(text)
+    setMediaModels(media)
+    saveMediaModels(media)
     setSettingsOpen(false)
   }
 
@@ -92,7 +95,7 @@ export default function App() {
           </p>
         </header>
 
-        <IdeaForm onAdd={addIdea} />
+        <IdeaForm onAdd={addIdea} transcriptionModel={mediaModels.transcription} />
 
         <section className="board">
           <h2 className="board-title">
@@ -108,14 +111,27 @@ export default function App() {
           ) : (
             <ul className="card-list">
               {ideas.map((idea) => (
-                <IdeaCard key={idea.id} idea={idea} aiModel={aiModel} onDelete={removeIdea} onUpdate={updateIdea} />
+                <IdeaCard
+                  key={idea.id}
+                  idea={idea}
+                  aiModel={aiModel}
+                  mediaModels={mediaModels}
+                  onDelete={removeIdea}
+                  onUpdate={updateIdea}
+                />
               ))}
             </ul>
           )}
         </section>
       </main>
 
-      <SettingsDialog open={settingsOpen} model={aiModel} onSave={changeModel} onClose={() => setSettingsOpen(false)} />
+      <SettingsDialog
+        open={settingsOpen}
+        model={aiModel}
+        mediaModels={mediaModels}
+        onSave={changeModels}
+        onClose={() => setSettingsOpen(false)}
+      />
     </div>
   )
 }
